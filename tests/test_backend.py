@@ -1,4 +1,4 @@
-"""Loopback integration test for the C++ backend extension."""
+"""Loopback integration test for the queued backing extension."""
 from __future__ import annotations
 
 import importlib
@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-backend = importlib.import_module("backend")
+backing = importlib.import_module("backing")
 
 
 HOST = "127.0.0.1"
@@ -22,10 +22,10 @@ def available_port() -> int:
 
 
 def main() -> None:
-    assert backend.MAX_UNAUTH_PAYLOAD == 65535
-    assert backend.MAX_AUTH_PAYLOAD == 33554431
+    assert backing.MAX_UNAUTH_PAYLOAD == 65535
+    assert backing.MAX_AUTH_PAYLOAD == 33554431
     port = available_port()
-    server_box: dict[str, backend.Server] = {}
+    server_box: dict[str, backing.Server] = {}
     handshake_done = threading.Event()
     exchange_done = threading.Event()
     callback_errors: list[str] = []
@@ -33,12 +33,12 @@ def main() -> None:
     def handshake_worker(temp_cid: bytes) -> None:
         try:
             server = server_box["server"]
-            first_message = server.recv(temp_cid, timeout=5)
+            first_message = server.recv_handshake(temp_cid, timeout=5)
             if first_message != b"client hello\x00\xff":
                 raise AssertionError(f"unexpected first handshake message: {first_message!r}")
 
-            server.send(temp_cid, b"server challenge")
-            proof = server.recv(temp_cid, timeout=5)
+            server.send_handshake(temp_cid, b"server challenge")
+            proof = server.recv_handshake(temp_cid, timeout=5)
             if proof != b"client proof":
                 raise AssertionError(f"unexpected proof: {proof!r}")
 
@@ -57,13 +57,13 @@ def main() -> None:
             message = server.recv(cid, eid=eid, timeout=5)
             if message != b"exchange request":
                 raise AssertionError(f"unexpected exchange payload: {message!r}")
-            server.send(cid, b"exchange response", eid=eid)
+            server.send(b"exchange response", cid, eid=eid)
         except BaseException as exc:
             callback_errors.append(repr(exc))
         finally:
             exchange_done.set()
 
-    server = backend.Server(
+    server = backing.Server(
         HOST,
         port,
         handshake_worker=handshake_worker,
@@ -72,7 +72,7 @@ def main() -> None:
         simult_exchanges=4,
     )
     server_box["server"] = server
-    client = backend.Client(HOST, port)
+    client = backing.Client(HOST, port)
 
     try:
         server.start()
@@ -80,11 +80,11 @@ def main() -> None:
         assert len(server.MAGIC1) == 8 and len(server.MAGIC2) == 8
         assert client.MAGIC1 == server.MAGIC1 and client.MAGIC2 == server.MAGIC2
 
-        client.send(b"client hello\x00\xff")
-        assert client.recv(timeout=5) == b"server challenge"
-        client.send(b"client proof")
+        client.send_handshake(b"client hello\x00\xff")
+        assert client.recv_handshake(timeout=5) == b"server challenge"
+        client.send_handshake(b"client proof")
 
-        confirmation = client.recv(timeout=5)
+        confirmation = client.recv_handshake(timeout=5)
         assert confirmation == b"AUTH_OK", confirmation
         if not handshake_done.wait(5):
             raise AssertionError("handshake callback did not finish")
@@ -109,7 +109,7 @@ def main() -> None:
             raise AssertionError("callback error(s): " + "; ".join(callback_errors))
 
         # Start an exchange in the reverse direction and send multiple messages on one EID.
-        server_eid = server.send(b"client-A", b"server-initiated exchange")
+        server_eid = server.send(b"server-initiated exchange", b"client-A")
         assert isinstance(server_eid, bytes) and len(server_eid) == 8
         assert client.recv(eid=server_eid, timeout=5) == b"server-initiated exchange"
         client.send(b"client reply on existing exchange", eid=server_eid)

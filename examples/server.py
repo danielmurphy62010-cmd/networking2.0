@@ -6,24 +6,24 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import backend
+import backing
 
 HOST = "0.0.0.0"
 PORT = 8765
 CLIENT_ID = b"example-client"
-server: backend.Server
+server: backing.Server
 
 
 def handshake_worker(temp_cid: bytes) -> None:
     """The first unauthenticated payload is queued before this runs."""
     try:
-        hello = server.recv(temp_cid, timeout=15)
+        hello = server.recv_handshake(temp_cid, timeout=15)
         if hello != b"HELLO":
             print(f"Rejecting handshake with unexpected greeting: {hello!r}")
             return
 
-        server.send(temp_cid, b"CHALLENGE")
-        proof = server.recv(temp_cid, timeout=15)
+        server.send_handshake(temp_cid, b"CHALLENGE")
+        proof = server.recv_handshake(temp_cid, timeout=15)
         if proof != b"PROOF":
             print("Rejecting handshake: invalid proof")
             return
@@ -46,7 +46,7 @@ def on_exchange(cid: bytes, eid: bytes) -> None:
             response = b"READY_ACK"
         else:
             response = b"ECHO:" + request
-        server.send(cid, response, eid=eid)
+        server.send(response, cid, eid=eid)
         server.forget_exchange(cid, eid)  # This example treats each request/reply as one-shot.
     except Exception as exc:
         print(f"Exchange error for {cid!r}/{eid.hex()}: {exc}")
@@ -54,7 +54,7 @@ def on_exchange(cid: bytes, eid: bytes) -> None:
 
 def main() -> None:
     global server
-    server = backend.Server(
+    server = backing.Server(
         HOST,
         PORT,
         handshake_worker=handshake_worker,

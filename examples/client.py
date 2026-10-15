@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import backend
+import backing
 
 
 def main() -> None:
@@ -15,16 +15,16 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 
-    client = backend.Client(args.host, args.port)
+    client = backing.Client(args.host, args.port)
     try:
         client.connect()
-        client.send(b"HELLO?")
-        challenge = client.recv(timeout=10)
+        client.send_handshake(b"HELLO")
+        challenge = client.recv_handshake(timeout=10)
         if challenge != b"CHALLENGE":
             raise RuntimeError(f"unexpected challenge: {challenge!r}")
 
-        client.send(b"PROOF")
-        confirmation = client.recv(timeout=10)
+        client.send_handshake(b"PROOF")
+        confirmation = client.recv_handshake(timeout=10)
         if confirmation != b"AUTH_OK":
             raise RuntimeError(f"authentication failed: {confirmation!r}")
         client.auth_finished(b"example-client")

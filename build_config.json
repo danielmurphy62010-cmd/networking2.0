@@ -1,28 +1,19 @@
 {
   "python_version": "3.14",
-  "module_name": "backend",
-  "sources": [
-    "src/backend.cpp"
-  ],
-  "build_dependencies": [
-    "setuptools>=68",
-    "wheel>=0.43",
-    "pybind11>=2.13.6"
-  ],
+  "module_name": "backing",
+  "sources": ["src/backend.cpp"],
+  "build_dependencies": ["setuptools>=68", "wheel>=0.43", "pybind11>=2.13.6"],
   "cxx_standard": 17,
-  "windows_libraries": [
-    "ws2_32",
-    "bcrypt"
-  ],
+  "windows_libraries": ["ws2_32", "bcrypt"],
   "unix_libraries": [],
   "compiler_args": {
     "msvc": ["/W4", "/EHsc"],
     "unix": ["-Wall", "-Wextra", "-Wpedantic"]
   },
   "artifacts": {
-    "windows_pattern": "backend*.pyd",
-    "linux_pattern": "backend*.so",
-    "windows_name": "backend-windows-pyd",
-    "linux_name": "backend-linux-so"
+    "windows_pattern": "backing*.pyd",
+    "linux_pattern": "backing*.so",
+    "windows_name": "backing-windows-pyd",
+    "linux_name": "backing-linux-so"
   }
 }
