@@ -218,7 +218,7 @@ bool room;{std::lock_guard<std::mutex>l(c->mutex);room=c->recvq.size()<QUEUE_LIM
  std::string host_;uint16_t port_;py::object oe_;bool has_oe_;Pool exchanges_;std::shared_ptr<Conn>conn_;std::string magic1_,magic2_;std::atomic<bool>connected_{false};std::thread io_;
 };
 }
-PYBIND11_MODULE(backing,m){m.doc()="Networking v2.0 queued TCP backend";m.attr("MAX_UNAUTH_PAYLOAD")=MAX_UNAUTH;m.attr("MAX_AUTH_PAYLOAD")=MAX_AUTH;m.attr("QUEUE_LIMIT")=QUEUE_LIMIT;
+PYBIND11_MODULE(backend,m){m.doc()="Networking v2.0 queued TCP backend";m.attr("MAX_UNAUTH_PAYLOAD")=MAX_UNAUTH;m.attr("MAX_AUTH_PAYLOAD")=MAX_AUTH;m.attr("QUEUE_LIMIT")=QUEUE_LIMIT;
 py::class_<Server>(m,"Server").def(py::init<std::string,uint16_t,py::object,py::object,size_t,size_t>(),py::arg("host"),py::arg("port"),py::arg("handshake_worker")=py::none(),py::arg("on_exchange")=py::none(),py::arg("simult_handshakes")=4,py::arg("simult_exchanges")=4)
 .def("start",&Server::start).def("stop",[](Server&s){py::gil_scoped_release g;s.stop();})
 .def("send",[](Server&s,py::bytes data,py::bytes cid,py::object eid){return s.send(data,cid,eid);},py::arg("data"),py::arg("cid"),py::arg("eid")=py::none())
