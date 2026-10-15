@@ -1218,7 +1218,7 @@ private:
     std::thread reader_thread_;
 };
 
-PYBIND11_MODULE(network, module) {
+PYBIND11_MODULE(backend, module) {
     module.doc() = "Networking v2.0 TCP messaging module";
     module.attr("MAX_UNAUTH_PAYLOAD") = MAX_UNAUTH_PAYLOAD;
     module.attr("MAX_AUTH_PAYLOAD") = MAX_AUTH_PAYLOAD;
