@@ -15,9 +15,13 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 
-    client = backing.Client(args.host, args.port)
+    def on_exchange(eid: bytes) -> None:
+        request = client.recv(eid=eid, timeout=10)
+        if request is not None:
+            client.send(b"CLIENT:" + request, eid=eid)
+
+    client = backing.Client(args.host, args.port, on_exchange=on_exchange)
     try:
-        client.connect()
         client.send_handshake(b"HELLO")
         challenge = client.recv_handshake(timeout=10)
         if challenge != b"CHALLENGE":
@@ -27,7 +31,7 @@ def main() -> None:
         confirmation = client.recv_handshake(timeout=10)
         if confirmation != b"AUTH_OK":
             raise RuntimeError(f"authentication failed: {confirmation!r}")
-        client.auth_finished(b"example-client")
+        client.auth_finished()
 
         # The first authenticated client message tells the server the client has switched modes.
         ready_eid = client.send(b"READY")
@@ -36,10 +40,8 @@ def main() -> None:
 
         eid = client.send(b"Hello from the Python client")
         print("Server says:", client.recv(eid=eid, timeout=10))
-        client.forget_exchange(ready_eid)
-        client.forget_exchange(eid)
     finally:
-        client.disconnect()
+        client.close()
 
 
 if __name__ == "__main__":

@@ -47,7 +47,6 @@ def on_exchange(cid: bytes, eid: bytes) -> None:
         else:
             response = b"ECHO:" + request
         server.send(response, cid, eid=eid)
-        server.forget_exchange(cid, eid)  # This example treats each request/reply as one-shot.
     except Exception as exc:
         print(f"Exchange error for {cid!r}/{eid.hex()}: {exc}")
 

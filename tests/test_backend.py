@@ -76,7 +76,6 @@ def main() -> None:
 
     try:
         server.start()
-        client.connect()
         assert len(server.MAGIC1) == 8 and len(server.MAGIC2) == 8
         assert client.MAGIC1 == server.MAGIC1 and client.MAGIC2 == server.MAGIC2
 
@@ -90,7 +89,7 @@ def main() -> None:
             raise AssertionError("handshake callback did not finish")
         if callback_errors:
             raise AssertionError("callback error(s): " + "; ".join(callback_errors))
-        client.auth_finished(b"client-A")
+        client.auth_finished()
         assert client.is_authed
         assert server.is_authed(b"client-A")
 
@@ -115,13 +114,9 @@ def main() -> None:
         client.send(b"client reply on existing exchange", eid=server_eid)
         assert server.recv(b"client-A", eid=server_eid, timeout=5) == b"client reply on existing exchange"
 
-        server.forget_exchange(b"client-A", eid)
-        client.forget_exchange(eid)
-        server.forget_exchange(b"client-A", server_eid)
-        client.forget_exchange(server_eid)
         print("Networking v2.0 integration test passed.")
     finally:
-        client.disconnect()
+        client.close()
         server.stop()
 
 
