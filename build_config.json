@@ -1,8 +1,8 @@
 {
   "python_version": "3.14",
-  "module_name": "network",
+  "module_name": "backend",
   "sources": [
-    "src/network.cpp"
+    "src/backend.cpp"
   ],
   "build_dependencies": [
     "setuptools>=68",
@@ -20,9 +20,9 @@
     "unix": ["-Wall", "-Wextra", "-Wpedantic"]
   },
   "artifacts": {
-    "windows_pattern": "network*.pyd",
-    "linux_pattern": "network*.so",
-    "windows_name": "network-windows-pyd",
-    "linux_name": "network-linux-so"
+    "windows_pattern": "backend*.pyd",
+    "linux_pattern": "backend*.so",
+    "windows_name": "backend-windows-pyd",
+    "linux_name": "backend-linux-so"
   }
 }

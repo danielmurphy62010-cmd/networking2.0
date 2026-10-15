@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import network
+import backend
 
 
 def main() -> None:
@@ -15,10 +15,10 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 
-    client = network.Client(args.host, args.port)
+    client = backend.Client(args.host, args.port)
     try:
         client.connect()
-        client.send(b"HELLO")
+        client.send(b"HELLO?")
         challenge = client.recv(timeout=10)
         if challenge != b"CHALLENGE":
             raise RuntimeError(f"unexpected challenge: {challenge!r}")

@@ -6,12 +6,12 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import network
+import backend
 
 HOST = "0.0.0.0"
 PORT = 8765
 CLIENT_ID = b"example-client"
-server: network.Server
+server: backend.Server
 
 
 def handshake_worker(temp_cid: bytes) -> None:
@@ -54,7 +54,7 @@ def on_exchange(cid: bytes, eid: bytes) -> None:
 
 def main() -> None:
     global server
-    server = network.Server(
+    server = backend.Server(
         HOST,
         PORT,
         handshake_worker=handshake_worker,

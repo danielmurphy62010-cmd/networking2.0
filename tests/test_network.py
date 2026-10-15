@@ -1,4 +1,4 @@
-"""Loopback integration test for the C++ network extension."""
+"""Loopback integration test for the C++ backend extension."""
 from __future__ import annotations
 
 import importlib
@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-network = importlib.import_module("network")
+backend = importlib.import_module("backend")
 
 
 HOST = "127.0.0.1"
@@ -22,10 +22,10 @@ def available_port() -> int:
 
 
 def main() -> None:
-    assert network.MAX_UNAUTH_PAYLOAD == 65535
-    assert network.MAX_AUTH_PAYLOAD == 33554431
+    assert backend.MAX_UNAUTH_PAYLOAD == 65535
+    assert backend.MAX_AUTH_PAYLOAD == 33554431
     port = available_port()
-    server_box: dict[str, network.Server] = {}
+    server_box: dict[str, backend.Server] = {}
     handshake_done = threading.Event()
     exchange_done = threading.Event()
     callback_errors: list[str] = []
@@ -63,7 +63,7 @@ def main() -> None:
         finally:
             exchange_done.set()
 
-    server = network.Server(
+    server = backend.Server(
         HOST,
         port,
         handshake_worker=handshake_worker,
@@ -72,7 +72,7 @@ def main() -> None:
         simult_exchanges=4,
     )
     server_box["server"] = server
-    client = network.Client(HOST, port)
+    client = backend.Client(HOST, port)
 
     try:
         server.start()
