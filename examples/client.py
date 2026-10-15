@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import backing
+import backend
 
 
 def main() -> None:
@@ -20,7 +20,7 @@ def main() -> None:
         if request is not None:
             client.send(b"CLIENT:" + request, eid=eid)
 
-    client = backing.Client(args.host, args.port, on_exchange=on_exchange)
+    client = backend.Client(args.host, args.port, on_exchange=on_exchange)
     try:
         client.send_handshake(b"HELLO")
         challenge = client.recv_handshake(timeout=10)
