@@ -1,0 +1,28 @@
+{
+  "python_version": "3.14",
+  "module_name": "network",
+  "sources": [
+    "src/network.cpp"
+  ],
+  "build_dependencies": [
+    "setuptools>=68",
+    "wheel>=0.43",
+    "pybind11>=2.13.6"
+  ],
+  "cxx_standard": 17,
+  "windows_libraries": [
+    "ws2_32",
+    "bcrypt"
+  ],
+  "unix_libraries": [],
+  "compiler_args": {
+    "msvc": ["/W4", "/EHsc"],
+    "unix": ["-Wall", "-Wextra", "-Wpedantic"]
+  },
+  "artifacts": {
+    "windows_pattern": "network*.pyd",
+    "linux_pattern": "network*.so",
+    "windows_name": "network-windows-pyd",
+    "linux_name": "network-linux-so"
+  }
+}
