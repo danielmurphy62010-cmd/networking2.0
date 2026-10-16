@@ -185,13 +185,19 @@ class Client {
 public:
  Client(std::string h,uint16_t p,py::object oe,size_t se):host_(std::move(h)),port_(p),oe_(std::move(oe)),has_oe_(!oe_.is_none()),exchanges_(se){init_sockets();connect();}
  ~Client(){close();}
- void connect(){if(connected_)throw std::runtime_error("already connected");addrinfo hints{};hints.ai_family=AF_UNSPEC;hints.ai_socktype=SOCK_STREAM;addrinfo*r=nullptr;auto serv=std::to_string(port_);if(getaddrinfo(host_.c_str(),serv.c_str(),&hints,&r))throw std::runtime_error("getaddrinfo failed");socket_t s=BAD_SOCKET;for(auto*x=r;x;x=x->ai_next){s=::socket(x->ai_family,x->ai_socktype,x->ai_protocol);if(s==BAD_SOCKET)continue;if(::connect(s,x->ai_addr,(int)x->ai_addrlen)==0)break;close_sock(s);s=BAD_SOCKET;}freeaddrinfo(r);if(s==BAD_SOCKET)throw std::runtime_error("connect failed");std::array<char,16>g{};size_t got=0;while(got<g.size()){
+void connect() {if (connected_)throw std::runtime_error("already connected");init_sockets();addrinfo hints{};hints.ai_family = AF_UNSPEC;hints.ai_socktype = SOCK_STREAM;hints.ai_protocol = IPPROTO_TCP;addrinfo* r = nullptr;const auto serv = std::to_string(port_);const int grc = getaddrinfo(host_.c_str(), serv.c_str(), &hints, &r);if (grc != 0) {
 #ifdef _WIN32
-int n=::recv(s,g.data()+got,(int)(g.size()-got),0);
+throw std::runtime_error("getaddrinfo failed: " + std::to_string(grc));
 #else
-ssize_t n=::recv(s,g.data()+got,g.size()-got,0);
+throw std::runtime_error(std::string("getaddrinfo failed: ") + gai_strerror(grc));
 #endif
-if(n<=0){close_sock(s);throw std::runtime_error("failed to receive framing greeting");}got+=n;}conn_=std::make_shared<Conn>();conn_->sock=s;conn_->magic1.assign(g.data(),8);conn_->magic2.assign(g.data()+8,8);magic1_=conn_->magic1;magic2_=conn_->magic2;nonblocking(s);connected_=true;io_=std::thread([this]{loop();});}
+}socket_t s = BAD_SOCKET;int last_error = 0;for (auto* x = r; x; x = x->ai_next) {socket_t candidate =::socket(x->ai_family, x->ai_socktype, x->ai_protocol);if (candidate == BAD_SOCKET) {last_error = sockerr();continue;}if (::connect(candidate, x->ai_addr,static_cast<int>(x->ai_addrlen)) == 0) {s = candidate;break;}last_error = sockerr();close_sock(candidate);}freeaddrinfo(r);if (s == BAD_SOCKET) {throw std::runtime_error("connect failed; socket error=" + std::to_string(last_error));}std::array<char, 16> greeting{};size_t got = 0;while (got < greeting.size()) {
+#ifdef _WIN32
+int n = ::recv(s, greeting.data() + got,static_cast<int>(greeting.size() - got), 0);
+#else
+ssize_t n = ::recv(s, greeting.data() + got,greeting.size() - got, 0);
+#endif
+if (n <= 0) {int err = n < 0 ? sockerr() : 0;close_sock(s);throw std::runtime_error("failed to receive framing greeting; socket error=" + std::to_string(err));}got += static_cast<size_t>(n);}conn_ = std::make_shared<Conn>();conn_->sock = s;conn_->magic1.assign(greeting.data(), 8);conn_->magic2.assign(greeting.data() + 8, 8);magic1_ = conn_->magic1;magic2_ = conn_->magic2;try {nonblocking(s);} catch (...) {close_sock(s);conn_->sock = BAD_SOCKET;conn_.reset();throw;}connected_ = true;io_ = std::thread([this] { loop(); });}
  void close(){if(!connected_.exchange(false)){exchanges_.stop();return;}if(conn_){conn_->closed=true;close_sock(conn_->sock);conn_->sock=BAD_SOCKET;{std::lock_guard<std::mutex>l(conn_->mutex);conn_->recvq.clear();conn_->sendq.clear();conn_->input.clear();conn_->wire.clear();}{std::lock_guard<std::mutex>l(conn_->eid_mutex);conn_->eids.clear();conn_->eid_activity.clear();}conn_->cv.notify_all();}if(io_.joinable()&&io_.get_id()!=std::this_thread::get_id())io_.join();exchanges_.stop();}
  py::object send(py::bytes pb,py::object eb){auto c=conn_;if(!c||!connected_)throw std::runtime_error("not connected");if(!c->authed)throw std::runtime_error("normal send is unavailable before authentication; use send_handshake(data)");auto e=eid_arg(eb);std::string id;if(e)id=*e;else{do{id=random_bytes(8);}while(!add_eid(id));}if(e)add_eid(id);enqueue(Pending{as_string(pb),id,true});return py::object(as_bytes(id));}
  void send_handshake(py::bytes pb){auto c=conn_;if(!c||!connected_||c->authed)throw std::runtime_error("handshake send only allowed while connected and unauthenticated");enqueue(Pending{as_string(pb),{},false});}
@@ -200,7 +206,6 @@ if(n<=0){close_sock(s);throw std::runtime_error("failed to receive framing greet
  bool auth_finished(){if(!conn_||!connected_)throw std::runtime_error("not connected");conn_->authed=true;return true;}
  bool is_authed()const{return conn_&&conn_->authed;}py::bytes cid()const{return conn_&&conn_->authed?as_bytes(conn_->cid):py::bytes();}py::bytes MAGIC1()const{return as_bytes(magic1_);}py::bytes MAGIC2()const{return as_bytes(magic2_);}
  void set_backpressure(bool b){if(!conn_)throw std::runtime_error("not connected");conn_->backpressure=b;}
-
 private:
  bool add_eid(const std::string&e){std::lock_guard<std::mutex>l(conn_->eid_mutex);auto fresh=conn_->eids.insert(e).second;conn_->eid_activity[e]=std::chrono::steady_clock::now();return fresh;}
  void cleanup_exchanges(const std::shared_ptr<Conn>&c){auto now=std::chrono::steady_clock::now();std::set<std::string> expired;{std::lock_guard<std::mutex>l(c->eid_mutex);for(auto i=c->eid_activity.begin();i!=c->eid_activity.end();){if(now-i->second>=std::chrono::minutes(1)){expired.insert(i->first);c->eids.erase(i->first);i=c->eid_activity.erase(i);}else ++i;}}if(!expired.empty()){std::lock_guard<std::mutex>l(c->mutex);auto drop=[&](auto&m){return expired.count(m.eid)>0;};c->recvq.erase(std::remove_if(c->recvq.begin(),c->recvq.end(),drop),c->recvq.end());c->sendq.erase(std::remove_if(c->sendq.begin(),c->sendq.end(),drop),c->sendq.end());c->cv.notify_all();}}
