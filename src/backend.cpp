@@ -21,6 +21,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef __linux__
+#include <sys/random.h>
+#endif
 #ifndef _WIN32
 #include <fcntl.h>
 #endif
@@ -37,6 +40,7 @@ static constexpr socket_t BAD_SOCKET = INVALID_SOCKET;
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -91,9 +95,29 @@ u_long mode=1; if(ioctlsocket(s,FIONBIO,&mode)!=0) throw std::runtime_error("ioc
 int f=fcntl(s,F_GETFL,0); if(f<0 || fcntl(s,F_SETFL,f|O_NONBLOCK)<0) throw std::runtime_error("fcntl nonblocking failed");
 #endif
 }
+void tune_socket(socket_t s){
+    // Large buffers keep TCP's send/receive windows from throttling bulk transfers.
+    int buffer_size = 4 * 1024 * 1024;
+    int one = 1;
+#ifdef _WIN32
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&buffer_size), sizeof(buffer_size));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&buffer_size), sizeof(buffer_size));
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
+#else
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+#endif
+}
 void random_fill(uint8_t* p,size_t n){
 #ifdef _WIN32
 if(BCryptGenRandom(nullptr,p,(ULONG)n,BCRYPT_USE_SYSTEM_PREFERRED_RNG)!=0) throw std::runtime_error("BCryptGenRandom failed");
+#elif defined(__linux__)
+size_t done=0;
+while(done<n){ ssize_t got=::getrandom(p+done,n-done,0); if(got>0){done+=(size_t)got;continue;} if(got<0&&errno==EINTR)continue; break; }
+if(done==n)return;
+FILE* f=fopen("/dev/urandom","rb"); if(!f)throw std::runtime_error("cannot open /dev/urandom");
+size_t got=fread(p+done,1,n-done,f); fclose(f); if(got!=n-done)throw std::runtime_error("random source failed");
 #else
 FILE* f=fopen("/dev/urandom","rb"); if(!f) throw std::runtime_error("cannot open /dev/urandom"); size_t got=fread(p,1,n,f); fclose(f); if(got!=n)throw std::runtime_error("random source failed");
 #endif
@@ -103,7 +127,21 @@ std::string as_string(const py::bytes& b){return (std::string)b;}
 py::bytes as_bytes(const std::string& s){return py::bytes(s.data(),s.size());}
 uint16_t u16(const uint8_t*p){return (uint16_t(p[0])<<8)|p[1];}
 uint32_t u32(const uint8_t*p){return (uint32_t(p[0])<<24)|(uint32_t(p[1])<<16)|(uint32_t(p[2])<<8)|p[3];}
-std::optional<size_t> find_bytes(const std::vector<uint8_t>& b,const std::string& m,size_t start=0){if(m.empty()||b.size()<m.size()||start>b.size()-m.size())return {};for(size_t i=start;i+m.size()<=b.size();++i)if(!memcmp(b.data()+i,m.data(),m.size()))return i;return {};}
+std::optional<size_t> find_bytes(const std::vector<uint8_t>& b, const std::string& m, size_t start=0) {
+    if (m.empty() || b.size() < m.size() || start > b.size() - m.size()) return {};
+    const uint8_t* cur = b.data() + start;
+    const uint8_t* last = b.data() + b.size() - m.size();
+    while (cur <= last) {
+        const void* hit = std::memchr(cur, static_cast<unsigned char>(m[0]),
+                                      static_cast<size_t>(last - cur + 1));
+        if (!hit) return {};
+        cur = static_cast<const uint8_t*>(hit);
+        if (std::memcmp(cur, m.data(), m.size()) == 0)
+            return static_cast<size_t>(cur - b.data());
+        ++cur;
+    }
+    return {};
+}
 void trim_prefix(std::vector<uint8_t>&b,const std::string&m){size_t keep=std::min(b.size(),m.size()-1);while(keep){if(!memcmp(b.data()+b.size()-keep,m.data(),keep)){b.erase(b.begin(),b.end()-static_cast<ptrdiff_t>(keep));return;}--keep;}b.clear();}
 struct Message {std::string eid; std::string payload; bool authed=false;};
 struct Pending {std::string payload; std::string eid; bool authed=false;};
@@ -114,6 +152,8 @@ struct Conn {
  uint64_t connection_id = 0;
  std::mutex mutex; std::condition_variable cv; std::deque<Message> recvq; std::deque<Pending> sendq;
  std::vector<uint8_t> input, wire; size_t wire_off=0;
+ std::chrono::steady_clock::time_point last_cleanup = std::chrono::steady_clock::now();
+ Conn(){ input.reserve(256 * 1024); }
  std::mutex eid_mutex; std::set<std::string> eids; std::map<std::string,std::chrono::steady_clock::time_point> eid_activity;
 };
 class Pool {
@@ -149,32 +189,98 @@ std::vector<uint8_t> frame(const Conn&c,const Pending&p){
         ptr[3] = (uint8_t)(payload_size & 255);
         ptr[4] = '0';
         std::memcpy(ptr + 5, p.eid.data(), EID_N);
-        ptr += AUTH_HEAD;
+        ptr += AUTH_HEAD + EID_N;
     }
     std::memcpy(ptr, p.payload.data(), payload_size);
     ptr += payload_size;
     std::memcpy(ptr, c.magic2.data(), MAGIC_N);
     return v;
 }
-template<class Deliver> bool parse(Conn&c,Deliver deliver){bool progress=false;for(;;){
-if(c.input.size() > MAX_INPUT_BUFFER){
-    auto first_magic = find_bytes(c.input, c.magic1);
-    if(!first_magic){
-        c.input.clear();
-    } else if(*first_magic > 0){
-        c.input.erase(c.input.begin(), c.input.begin() + *first_magic);
-    } else {
-        auto next_magic = find_bytes(c.input, c.magic1, MAGIC_N);
-        if(next_magic){
-            c.input.erase(c.input.begin(), c.input.begin() + *next_magic);
-        } else {
-            c.input.clear();
+template<class Deliver> bool parse(Conn& c, Deliver deliver) {
+    bool progress = false;
+    size_t off = 0;
+    auto compact = [&]() {
+        if (off) c.input.erase(c.input.begin(), c.input.begin() + static_cast<ptrdiff_t>(off));
+        off = 0;
+    };
+    for (;;) {
+        const size_t remaining = c.input.size() - off;
+        if (remaining > MAX_INPUT_BUFFER) {
+            auto first = find_bytes(c.input, c.magic1, off);
+            if (!first) { c.input.clear(); return true; }
+            if (*first > off) {
+                off = *first;
+            } else {
+                auto next = find_bytes(c.input, c.magic1, off + MAGIC_N);
+                if (next) off = *next;
+                else { c.input.clear(); return true; }
+            }
+            progress = true;
+            continue;
         }
+        if (remaining < MAGIC_N) { compact(); return progress; }
+
+        auto p = find_bytes(c.input, c.magic1, off);
+        if (!p) {
+            // Preserve only a possible partial magic suffix when resynchronizing.
+            size_t keep = std::min(c.input.size() - off, c.magic1.size() - 1);
+            while (keep && std::memcmp(c.input.data() + c.input.size() - keep,
+                                       c.magic1.data(), keep) != 0) --keep;
+            if (keep) {
+                size_t suffix = c.input.size() - keep;
+                c.input.erase(c.input.begin(), c.input.begin() + static_cast<ptrdiff_t>(suffix));
+            } else c.input.clear();
+            return progress;
+        }
+        if (*p > off) { off = *p; progress = true; }
+
+        const bool authed = c.authed.load(std::memory_order_relaxed);
+        const size_t header_size = authed ? AUTH_HEAD + EID_N : UNAUTH_HEAD;
+        const size_t body = MAGIC_N + header_size;
+        if (c.input.size() - off < body) { compact(); return progress; }
+
+        const uint8_t* base = c.input.data() + off;
+        uint32_t n = authed ? u32(base + MAGIC_N) : u16(base + MAGIC_N);
+        std::string eid;
+        if (authed) {
+            uint8_t flag = base[MAGIC_N + 4];
+            if (flag != '0' && flag != '1') {
+                auto next = find_bytes(c.input, c.magic1, off + 1);
+                if (next) off = *next;
+                else { c.input.clear(); return true; }
+                progress = true;
+                continue;
+            }
+            eid.assign(reinterpret_cast<const char*>(base + MAGIC_N + AUTH_HEAD), EID_N);
+        }
+        if (n > (authed ? MAX_AUTH : MAX_UNAUTH)) { ++off; progress = true; continue; }
+
+        const size_t total = body + static_cast<size_t>(n) + MAGIC_N;
+        // Don't rescan a growing payload on every socket read. Once the header is
+        // valid, wait for the declared frame length before doing corruption checks.
+        if (c.input.size() - off < total) { compact(); return progress; }
+        auto nested_magic = find_bytes(c.input, c.magic1, off + MAGIC_N);
+        if (nested_magic && *nested_magic < off + total) {
+            off = *nested_magic;
+            progress = true;
+            continue;
+        }
+        auto inner_end = find_bytes(c.input, c.magic2, off + body);
+        if (inner_end && *inner_end < off + total - MAGIC_N) {
+            off = *inner_end + MAGIC_N;
+            progress = true;
+            continue;
+        }
+        if (std::memcmp(c.input.data() + off + total - MAGIC_N, c.magic2.data(), MAGIC_N) != 0) {
+            ++off; progress = true; continue;
+        }
+
+        std::string payload(reinterpret_cast<const char*>(c.input.data() + off + body), n);
+        if (!deliver(authed, eid, std::move(payload))) { compact(); return progress; }
+        off += total;
+        progress = true;
     }
-    progress = true;
-    continue;
 }
-if(c.input.size()<MAGIC_N)return progress;auto p=find_bytes(c.input,c.magic1);if(!p){trim_prefix(c.input,c.magic1);return progress;}if(*p){c.input.erase(c.input.begin(),c.input.begin()+*p);progress=true;}bool a=c.authed.load();size_t hs=a?AUTH_HEAD+EID_N:UNAUTH_HEAD, body= MAGIC_N+hs;if(c.input.size()<body)return progress;uint32_t n= a?u32(c.input.data()+MAGIC_N):u16(c.input.data()+MAGIC_N);std::string eid;if(a){uint8_t flag=c.input[MAGIC_N+4];if(flag!='0'&&flag!='1'){auto next_m = find_bytes(c.input, c.magic1, 1);if(next_m){c.input.erase(c.input.begin(), c.input.begin() + *next_m);}else{c.input.clear();}progress=true;continue;}eid.assign((char*)c.input.data()+MAGIC_N+AUTH_HEAD,EID_N);}if(n>(a?MAX_AUTH:MAX_UNAUTH)){c.input.erase(c.input.begin());progress=true;continue;}size_t total=body+(size_t)n+MAGIC_N;auto p1=find_bytes(c.input,c.magic1,MAGIC_N);auto p2=find_bytes(c.input,c.magic2,body);if(p1&&*p1<total){c.input.erase(c.input.begin(),c.input.begin()+*p1);progress=true;continue;}if(p2&&*p2<total-MAGIC_N){c.input.erase(c.input.begin(),c.input.begin()+*p2+MAGIC_N);progress=true;continue;}if(c.input.size()<total)return progress;if(memcmp(c.input.data()+total-MAGIC_N,c.magic2.data(),MAGIC_N)){c.input.erase(c.input.begin());progress=true;continue;}std::string payload((char*)c.input.data()+body,n);if(!deliver(a,eid,std::move(payload)))return progress;c.input.erase(c.input.begin(),c.input.begin()+total);progress=true;}}
 std::optional<double> timeout_arg(const py::object&o){if(o.is_none())return {};double x=py::cast<double>(o);if(x<0)throw py::value_error("timeout must be >= 0 or None");return x;}
 std::optional<std::string> eid_arg(const py::object&o){if(o.is_none())return {};std::string e=as_string(py::cast<py::bytes>(o));if(e.size()!=EID_N)throw py::value_error("eid must be 8 bytes");return e;}
 class Server {
@@ -213,6 +319,8 @@ private:
  
  void cleanup_exchanges(const std::shared_ptr<Conn>&c){
      auto now=std::chrono::steady_clock::now();
+     if (now - c->last_cleanup < std::chrono::seconds(1)) return;
+     c->last_cleanup = now;
      std::set<std::string> expired;
      {
          std::unique_lock<std::mutex> l1(c->mutex);
@@ -259,7 +367,11 @@ private:
              fd_set r;
              FD_ZERO(&r);
              FD_SET(ls,&r);
-             timeval tv{0,2000};
+             const auto ticks = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 std::chrono::steady_clock::now().time_since_epoch()).count();
+             const auto last_io = last_io_ns_.load(std::memory_order_relaxed);
+             const bool recently_active = last_io != 0 && ticks - last_io < 5'000'000;
+             timeval tv{0, recently_active ? 0 : 1000};
              int n=select((int)(ls+1),&r,nullptr,nullptr,&tv);
              if(n>0&&FD_ISSET(ls,&r)){
                  for(;;){
@@ -282,7 +394,7 @@ private:
                          continue;
                      }
                      
-                     try{nonblocking(s);}catch(...){close_sock(s);continue;}
+                     try{tune_socket(s);nonblocking(s);}catch(...){close_sock(s);continue;}
                      auto c=std::make_shared<Conn>();
                      c->sock=s;
                      c->server_side=true;
@@ -330,94 +442,147 @@ private:
          {std::lock_guard<std::mutex>l(conns_m_);conns_.erase(std::remove_if(conns_.begin(),conns_.end(),[](auto&c){return c->closed.load();}),conns_.end());}
      }
  }
- void step(const std::shared_ptr<Conn>&c){if(c->closed)return;cleanup_exchanges(c);socket_t s=c->sock;if(s==BAD_SOCKET)return;
- uint64_t cid_val = c->connection_id;
- if(!c->input.empty()) parse(*c,[&](bool a,const std::string&e,std::string p){
-     std::lock_guard<std::mutex>l(c->mutex);
-     if(c->closed) return false;
-     if(c->recvq.size()>=QUEUE_LIMIT)return false;
-     c->recvq.push_back(Message{e,std::move(p),a});
-     c->cv.notify_all();
-     if(!a&&c->server_side&&!c->handshake_started.exchange(true)&&has_hw_){
-         auto t=c->temp_cid;
-         handshakes_.submit([this,t,cid_val]{
+ void note_io() {
+     const auto ticks = std::chrono::duration_cast<std::chrono::nanoseconds>(
+         std::chrono::steady_clock::now().time_since_epoch()).count();
+     last_io_ns_.store(ticks, std::memory_order_relaxed);
+ }
+ bool deliver_message(const std::shared_ptr<Conn>& c, bool a, const std::string& e, std::string p, uint64_t cid_val) {
+     {
+         std::lock_guard<std::mutex> lock(c->mutex);
+         if (c->closed || c->recvq.size() >= QUEUE_LIMIT) return false;
+         c->recvq.push_back(Message{e, std::move(p), a});
+         c->cv.notify_all();
+     }
+     // Do not call add_eid() while holding c->mutex: it acquires the same mutex.
+     if (!a && c->server_side && !c->handshake_started.exchange(true) && has_hw_) {
+         auto t = c->temp_cid;
+         handshakes_.submit([this, t, cid_val] {
              auto conn = find_temp(t);
-             if(!conn || conn->closed || conn->connection_id != cid_val) return;
+             if (!conn || conn->closed || conn->connection_id != cid_val) return;
              call_handshake(t);
          });
-     }else if(a){
-         bool fresh=add_eid(c,e);
-         if(fresh&&has_oe_){
-             std::string id=c->cid;
-             exchanges_.submit([this,id,e,cid_val]{
+     } else if (a) {
+         bool fresh = add_eid(c, e);
+         if (fresh && has_oe_) {
+             std::string id = c->cid;
+             exchanges_.submit([this, id, e, cid_val] {
                  auto conn = find(id);
-                 if(!conn || conn->closed || conn->connection_id != cid_val) return;
-                 call_exchange(id,e);
+                 if (!conn || conn->closed || conn->connection_id != cid_val) return;
+                 call_exchange(id, e);
              });
          }
      }
      return true;
- });
- 
- if(c->wire_off>=c->wire.size()){c->wire.clear();c->wire_off=0;Pending p;bool have=false;{std::lock_guard<std::mutex>l(c->mutex);if(!c->sendq.empty()){p=std::move(c->sendq.front());c->sendq.pop_front();have=true;}}if(have){try{c->wire=frame(*c,p);}catch(...){c->closed=true;close_sock(s);c->sock=BAD_SOCKET;return;}}}
- while(!c->wire.empty() && c->wire_off < c->wire.size()){
-     int n=::send(s,(const char*)c->wire.data()+c->wire_off,(int)std::min<size_t>(c->wire.size()-c->wire_off, 256UL * 1024),
-#ifdef _WIN32
-0
-#else
-MSG_NOSIGNAL
-#endif
-     );
-     if(n>0) {
-         c->wire_off+=n;
-     } else {
-         int err = sockerr();
-         if(would_block(err)) {
-             break;
-         } else {
-             c->closed=true;close_sock(s);c->sock=BAD_SOCKET;c->cv.notify_all();return;
-         }
-     }
  }
- 
- bool room;{std::lock_guard<std::mutex>l(c->mutex);room=c->recvq.size()<QUEUE_LIMIT;}
- if(!c->backpressure&&room){
-     uint8_t b[262144]; 
-     int n=::recv(s,(char*)b,sizeof(b),0);
-     if(n>0){
-         c->input.insert(c->input.end(),b,b+n);
-         parse(*c,[&](bool a,const std::string&e,std::string p){
-             std::lock_guard<std::mutex>l(c->mutex);
-             if(c->closed) return false;
-             if(c->recvq.size()>=QUEUE_LIMIT)return false;
-             c->recvq.push_back(Message{e,std::move(p),a});
-             c->cv.notify_all();
-             if(!a&&c->server_side&&!c->handshake_started.exchange(true)&&has_hw_){
-                 auto t=c->temp_cid;
-                 handshakes_.submit([this,t,cid_val]{
-                     auto conn = find_temp(t);
-                     if(!conn || conn->closed || conn->connection_id != cid_val) return;
-                     call_handshake(t);
-                 });
-             }else if(a){
-                 bool fresh=add_eid(c,e);
-                 if(fresh&&has_oe_){
-                     std::string id=c->cid;
-                     exchanges_.submit([this,id,e,cid_val]{
-                         auto conn = find(id);
-                         if(!conn || conn->closed || conn->connection_id != cid_val) return;
-                         call_exchange(id,e);
-                     });
+ void step(const std::shared_ptr<Conn>& c) {
+     if (c->closed) return;
+     cleanup_exchanges(c);
+     socket_t s = c->sock;
+     if (s == BAD_SOCKET) return;
+     const uint64_t cid_val = c->connection_id;
+
+     if (!c->input.empty()) {
+         parse(*c, [&](bool a, const std::string& e, std::string p) {
+             return deliver_message(c, a, e, std::move(p), cid_val);
+         });
+     }
+
+     // Send queued frames back-to-back instead of waiting for another I/O-loop turn
+     // after each frame. Stop immediately when the nonblocking socket is saturated.
+     for (;;) {
+         if (c->wire_off >= c->wire.size()) {
+             c->wire.clear();
+             c->wire_off = 0;
+             Pending pending;
+             bool have = false;
+             {
+                 std::lock_guard<std::mutex> lock(c->mutex);
+                 if (!c->sendq.empty()) {
+                     pending = std::move(c->sendq.front());
+                     c->sendq.pop_front();
+                     have = true;
                  }
              }
-             return true;
-         });
-     }else if(n==0||!would_block(sockerr())){c->closed=true;close_sock(s);c->sock=BAD_SOCKET;c->cv.notify_all();}
- }
+             if (!have) break;
+             try {
+                 c->wire = frame(*c, pending);
+             } catch (...) {
+                 c->closed = true;
+                 close_sock(s);
+                 c->sock = BAD_SOCKET;
+                 return;
+             }
+         }
+
+         bool blocked = false;
+         while (c->wire_off < c->wire.size()) {
+             int n = ::send(s, reinterpret_cast<const char*>(c->wire.data()) + c->wire_off,
+                            static_cast<int>(std::min<size_t>(c->wire.size() - c->wire_off, 1024UL * 1024)),
+#ifdef _WIN32
+                            0
+#else
+                            MSG_NOSIGNAL
+#endif
+             );
+             if (n > 0) {
+                 c->wire_off += static_cast<size_t>(n);
+                 note_io();
+                 continue;
+             }
+             int err = sockerr();
+             if (would_block(err)) { blocked = true; break; }
+             c->closed = true;
+             close_sock(s);
+             c->sock = BAD_SOCKET;
+             c->cv.notify_all();
+             return;
+         }
+         if (blocked) break;
+     }
+
+     bool room;
+     {
+         std::lock_guard<std::mutex> lock(c->mutex);
+         room = c->recvq.size() < QUEUE_LIMIT;
+     }
+     if (c->backpressure || !room) return;
+
+     // Drain all currently available bytes. One recv per 1 ms polling cycle capped
+     // aggregate throughput and added latency for large transfers.
+     uint8_t buffer[256 * 1024];
+     for (;;) {
+         int n = ::recv(s, reinterpret_cast<char*>(buffer), sizeof(buffer), 0);
+         if (n > 0) {
+             note_io();
+             c->input.insert(c->input.end(), buffer, buffer + n);
+             parse(*c, [&](bool a, const std::string& e, std::string p) {
+                 return deliver_message(c, a, e, std::move(p), cid_val);
+             });
+             {
+                 std::lock_guard<std::mutex> lock(c->mutex);
+                 if (c->recvq.size() >= QUEUE_LIMIT) break;
+             }
+             continue;
+         }
+         if (n == 0) {
+             c->closed = true;
+             close_sock(s);
+             c->sock = BAD_SOCKET;
+             c->cv.notify_all();
+             return;
+         }
+         if (would_block(sockerr())) break;
+         c->closed = true;
+         close_sock(s);
+         c->sock = BAD_SOCKET;
+         c->cv.notify_all();
+         return;
+     }
  }
  void call_handshake(std::string t){py::gil_scoped_acquire g;try{hw_(as_bytes(t));}catch(py::error_already_set&e){std::cerr<<"handshake_worker: "<<e.what()<<'\n';}}
  void call_exchange(std::string c,std::string e){auto conn=find(c);if(!conn)return;{std::lock_guard<std::mutex>l(conn->eid_mutex);if(!conn->eids.count(e))return;}py::gil_scoped_acquire g;try{oe_(as_bytes(c),as_bytes(e));}catch(py::error_already_set&x){std::cerr<<"on_exchange: "<<x.what()<<'\n';}}
- std::string host_;uint16_t port_;std::string magic1_,magic2_;py::object hw_,oe_;bool has_hw_,has_oe_;Pool handshakes_,exchanges_;std::atomic<bool>running_{false};std::atomic<socket_t>listener_{BAD_SOCKET};std::thread io_;std::mutex ids_m_,conns_m_;std::map<std::string,std::shared_ptr<Conn>>ids_,temps_;std::vector<std::shared_ptr<Conn>>conns_;
+ std::string host_;uint16_t port_;std::string magic1_,magic2_;py::object hw_,oe_;bool has_hw_,has_oe_;Pool handshakes_,exchanges_;std::atomic<bool>running_{false};std::atomic<socket_t>listener_{BAD_SOCKET};std::atomic<int64_t> last_io_ns_{0};std::thread io_;std::mutex ids_m_,conns_m_;std::map<std::string,std::shared_ptr<Conn>>ids_,temps_;std::vector<std::shared_ptr<Conn>>conns_;
 };
 class Client {
 public:
@@ -429,7 +594,7 @@ int n=::recv(s,g.data()+got,(int)(g.size()-got),0);
 #else
 ssize_t n=::recv(s,g.data()+got,g.size()-got,0);
 #endif
-if(n<=0){close_sock(s);throw std::runtime_error("failed to receive framing greeting");}got+=n;}conn_=std::make_shared<Conn>();conn_->sock=s;conn_->magic1.assign(g.data(),8);conn_->magic2.assign(g.data()+8,8);magic1_=conn_->magic1;magic2_=conn_->magic2;nonblocking(s);connected_=true;io_=std::thread([this]{loop();});}
+if(n<=0){close_sock(s);throw std::runtime_error("failed to receive framing greeting");}got+=n;}tune_socket(s);conn_=std::make_shared<Conn>();conn_->sock=s;conn_->connection_id=1;conn_->magic1.assign(g.data(),8);conn_->magic2.assign(g.data()+8,8);magic1_=conn_->magic1;magic2_=conn_->magic2;nonblocking(s);connected_=true;io_=std::thread([this]{loop();});}
  void close(){if(!connected_.exchange(false)){exchanges_.stop();return;}if(conn_){conn_->closed=true;close_sock(conn_->sock);conn_->sock=BAD_SOCKET;{std::lock_guard<std::mutex>l(conn_->mutex);conn_->recvq.clear();conn_->sendq.clear();conn_->input.clear();conn_->wire.clear();}{std::lock_guard<std::mutex>l(conn_->eid_mutex);conn_->eids.clear();conn_->eid_activity.clear();}conn_->cv.notify_all();}if(io_.joinable()&&io_.get_id()!=std::this_thread::get_id())io_.join();exchanges_.stop();}
  py::object send(py::bytes pb,py::object eb){auto c=conn_;if(!c||!connected_)throw std::runtime_error("not connected");if(!c->authed)throw std::runtime_error("normal send is unavailable before authentication; use send_handshake(data)");auto e=eid_arg(eb);std::string id;if(e)id=*e;else{do{id=random_bytes(8);}while(!add_eid(id));}if(e)add_eid(id);enqueue(Pending{as_string(pb),id,true});return py::object(as_bytes(id));}
  void send_handshake(py::bytes pb){auto c=conn_;if(!c||!connected_||c->authed)throw std::runtime_error("handshake send only allowed while connected and unauthenticated");enqueue(Pending{as_string(pb),{},false});}
@@ -449,6 +614,8 @@ private:
  }
  void cleanup_exchanges(const std::shared_ptr<Conn>&c){
      auto now=std::chrono::steady_clock::now();
+     if (now - c->last_cleanup < std::chrono::seconds(1)) return;
+     c->last_cleanup = now;
      std::set<std::string> expired;
      {
          std::unique_lock<std::mutex> l1(c->mutex);
@@ -470,78 +637,130 @@ private:
  }
  void enqueue(Pending p){std::lock_guard<std::mutex>l(conn_->mutex);if(conn_->sendq.size()>=QUEUE_LIMIT)throw py::value_error("send queue full (maximum 8)");conn_->sendq.push_back(std::move(p));}
  py::object pop(std::optional<std::string> e,bool a,std::optional<double> t){auto c=conn_;std::unique_lock<std::mutex>l(c->mutex);auto pred=[&]{return c->closed||std::any_of(c->recvq.begin(),c->recvq.end(),[&](auto&m){return m.authed==a&&(!a||m.eid==*e);});};bool ready=false;{py::gil_scoped_release release;if(t)ready=c->cv.wait_for(l,std::chrono::duration<double>(*t),pred);else{c->cv.wait(l,pred);ready=true;}}if(!ready)return py::none();auto i=std::find_if(c->recvq.begin(),c->recvq.end(),[&](auto&m){return m.authed==a&&(!a||m.eid==*e);});if(i==c->recvq.end())return py::none();auto p=std::move(i->payload);c->recvq.erase(i);return as_bytes(p);}
- void loop(){
-     uint64_t conn_id_val = 1;
-     while(connected_&&conn_&&!conn_->closed){
-         auto c=conn_;
-         cleanup_exchanges(c);
-         socket_t s=c->sock;
-         if(s==BAD_SOCKET)break;
-         if(!c->input.empty()) parse(*c,[&](bool a,const std::string&e,std::string p){
-             std::lock_guard<std::mutex>l(c->mutex);
-             if(c->recvq.size()>=QUEUE_LIMIT)return false;
-             c->recvq.push_back(Message{e,std::move(p),a});
-             c->cv.notify_all();
-             if(a){
-                 bool fresh=add_eid(e);
-                 if(fresh&&has_oe_){
-                     auto id=c->cid;
-                     exchanges_.submit([this,e,conn_id_val]{
-                         if(!conn_ || conn_->closed || conn_->connection_id != conn_id_val) return;
-                         call_exchange(e);
-                     });
-                 }
-             }
-             return true;
-         });
-         
-         if(c->wire_off>=c->wire.size()){c->wire.clear();c->wire_off=0;Pending p;bool have=false;{std::lock_guard<std::mutex>l(c->mutex);if(!c->sendq.empty()){p=std::move(c->sendq.front());c->sendq.pop_front();have=true;}}if(have){try{c->wire=frame(*c,p);}catch(...){c->closed=true;break;}}}
-         while(!c->wire.empty() && c->wire_off < c->wire.size()){
-             int n=::send(s,(const char*)c->wire.data()+c->wire_off,(int)std::min<size_t>(c->wire.size()-c->wire_off, 256UL * 1024),
-#ifdef _WIN32
-0
-#else
-MSG_NOSIGNAL
-#endif
-             );
-             if(n>0) {
-                 c->wire_off+=n;
-             } else {
-                 int err = sockerr();
-                 if(would_block(err)) {
-                     break;
-                 } else {
-                     c->closed=true;break;
-                 }
-             }
-         }
-         
-         bool room;{std::lock_guard<std::mutex>l(c->mutex);room=c->recvq.size()<QUEUE_LIMIT;}
-         if(!c->backpressure&&room){
-             uint8_t b[262144]; int n=::recv(s,(char*)b,sizeof(b),0);
-             if(n>0){
-                 c->input.insert(c->input.end(),b,b+n);
-                 parse(*c,[&](bool a,const std::string&e,std::string p){
-                     std::lock_guard<std::mutex>l(c->mutex);
-                     if(c->recvq.size()>=QUEUE_LIMIT)return false;
-                     c->recvq.push_back(Message{e,std::move(p),a});
-                     c->cv.notify_all();
-                     if(a){
-                         bool fresh=add_eid(e);
-                         if(fresh&&has_oe_){
-                             auto id=c->cid;
-                             exchanges_.submit([this,e,conn_id_val]{
-                                 if(!conn_ || conn_->closed || conn_->connection_id != conn_id_val) return;
-                                 call_exchange(e);
-                             });
-                         }
-                     }
-                     return true;
-                 });
-             }else if(n==0||!would_block(sockerr())){c->closed=true;break;}
+ bool deliver_message(const std::shared_ptr<Conn>& c, bool a, const std::string& e, std::string p, uint64_t conn_id_val) {
+     {
+         std::lock_guard<std::mutex> lock(c->mutex);
+         if (c->closed || c->recvq.size() >= QUEUE_LIMIT) return false;
+         c->recvq.push_back(Message{e, std::move(p), a});
+         c->cv.notify_all();
+     }
+     if (a) {
+         bool fresh = add_eid(e);
+         if (fresh && has_oe_) {
+             exchanges_.submit([this, e, conn_id_val] {
+                 if (!conn_ || conn_->closed || conn_->connection_id != conn_id_val) return;
+                 call_exchange(e);
+             });
          }
      }
-     if(conn_){conn_->closed=true;{std::lock_guard<std::mutex>l(conn_->mutex);conn_->recvq.clear();conn_->sendq.clear();conn_->input.clear();conn_->wire.clear();}{std::lock_guard<std::mutex>l(conn_->eid_mutex);conn_->eids.clear();conn_->eid_activity.clear();}conn_->cv.notify_all();}
+     return true;
+ }
+ void loop() {
+     const uint64_t conn_id_val = 1;
+     while (connected_ && conn_ && !conn_->closed) {
+         auto c = conn_;
+         cleanup_exchanges(c);
+         socket_t s = c->sock;
+         if (s == BAD_SOCKET) break;
+
+         if (!c->input.empty()) {
+             parse(*c, [&](bool a, const std::string& e, std::string p) {
+                 return deliver_message(c, a, e, std::move(p), conn_id_val);
+             });
+         }
+
+         for (;;) {
+             if (c->wire_off >= c->wire.size()) {
+                 c->wire.clear();
+                 c->wire_off = 0;
+                 Pending pending;
+                 bool have = false;
+                 {
+                     std::lock_guard<std::mutex> lock(c->mutex);
+                     if (!c->sendq.empty()) {
+                         pending = std::move(c->sendq.front());
+                         c->sendq.pop_front();
+                         have = true;
+                     }
+                 }
+                 if (!have) break;
+                 try {
+                     c->wire = frame(*c, pending);
+                 } catch (...) {
+                     c->closed = true;
+                     break;
+                 }
+             }
+
+             bool blocked = false;
+             while (c->wire_off < c->wire.size()) {
+                 int n = ::send(s, reinterpret_cast<const char*>(c->wire.data()) + c->wire_off,
+                                static_cast<int>(std::min<size_t>(c->wire.size() - c->wire_off, 1024UL * 1024)),
+#ifdef _WIN32
+                                0
+#else
+                                MSG_NOSIGNAL
+#endif
+                 );
+                 if (n > 0) {
+                     c->wire_off += static_cast<size_t>(n);
+                     continue;
+                 }
+                 int err = sockerr();
+                 if (would_block(err)) { blocked = true; break; }
+                 c->closed = true;
+                 break;
+             }
+             if (c->closed || blocked) break;
+         }
+         if (c->closed) break;
+
+         bool room;
+         {
+             std::lock_guard<std::mutex> lock(c->mutex);
+             room = c->recvq.size() < QUEUE_LIMIT;
+         }
+         if (c->backpressure || !room) continue;
+
+         uint8_t buffer[256 * 1024];
+         for (;;) {
+             int n = ::recv(s, reinterpret_cast<char*>(buffer), sizeof(buffer), 0);
+             if (n > 0) {
+                 c->input.insert(c->input.end(), buffer, buffer + n);
+                 parse(*c, [&](bool a, const std::string& e, std::string p) {
+                     return deliver_message(c, a, e, std::move(p), conn_id_val);
+                 });
+                 {
+                     std::lock_guard<std::mutex> lock(c->mutex);
+                     if (c->recvq.size() >= QUEUE_LIMIT) break;
+                 }
+                 continue;
+             }
+             if (n == 0) {
+                 c->closed = true;
+                 break;
+             }
+             if (would_block(sockerr())) break;
+             c->closed = true;
+             break;
+         }
+     }
+     if (conn_) {
+         conn_->closed = true;
+         {
+             std::lock_guard<std::mutex> lock(conn_->mutex);
+             conn_->recvq.clear();
+             conn_->sendq.clear();
+             conn_->input.clear();
+             conn_->wire.clear();
+         }
+         {
+             std::lock_guard<std::mutex> lock(conn_->eid_mutex);
+             conn_->eids.clear();
+             conn_->eid_activity.clear();
+         }
+         conn_->cv.notify_all();
+     }
  }
  void call_exchange(std::string e){auto c=conn_;if(!c)return;{std::lock_guard<std::mutex>l(c->eid_mutex);if(!c->eids.count(e))return;}py::gil_scoped_acquire g;try{oe_(as_bytes(e));}catch(py::error_already_set&x){std::cerr<<"on_exchange: "<<x.what()<<'\n';}}
  std::string host_;uint16_t port_;py::object oe_;bool has_oe_;Pool exchanges_;std::shared_ptr<Conn>conn_;std::string magic1_,magic2_;std::atomic<bool>connected_{false};std::thread io_;
