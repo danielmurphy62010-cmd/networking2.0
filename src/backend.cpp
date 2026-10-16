@@ -435,7 +435,7 @@ if(n<=0){close_sock(s);throw std::runtime_error("failed to receive framing greet
  void send_handshake(py::bytes pb){auto c=conn_;if(!c||!connected_||c->authed)throw std::runtime_error("handshake send only allowed while connected and unauthenticated");enqueue(Pending{as_string(pb),{},false});}
  py::object recv(py::object eo,py::object to){auto c=conn_;if(!c||!c->authed)throw std::runtime_error("normal recv is unavailable before authentication; use recv_handshake()");auto e=eid_arg(eo);if(!e)throw py::value_error("eid is required for authenticated recv");return pop(e,true,timeout_arg(to));}
  py::object recv_handshake(py::object to){auto c=conn_;if(!c||c->authed)throw std::runtime_error("handshake recv only allowed before authentication");return pop({},false,timeout_arg(to));}
- bool auth_finished(){if(!conn_||!connected_)throw std::runtime_error("not connected");return true;}
+ bool auth_finished(){if(!conn_ || !connected_) throw std::runtime_error("not connected");conn_->authed = true;return true;}
  bool is_authed()const{return conn_&&conn_->authed;}py::bytes cid()const{return conn_&&conn_->authed?as_bytes(conn_->cid):py::bytes();}py::bytes MAGIC1()const{return as_bytes(magic1_);}py::bytes MAGIC2()const{return as_bytes(magic2_);}
  void set_backpressure(bool b){if(!conn_)throw std::runtime_error("not connected");conn_->backpressure=b;}
 
