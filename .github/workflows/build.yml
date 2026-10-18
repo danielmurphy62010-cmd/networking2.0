@@ -4,15 +4,109 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '17 8 * * 1'
+
+permissions:
+  contents: read
 
 jobs:
+  discover:
+    name: Discover available stable CPython builds
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.generate.outputs.matrix }}
+    steps:
+      - name: Download the setup-python versions manifest
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location \
+            --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 \
+            https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json \
+            --output "$RUNNER_TEMP/versions-manifest.json"
+
+      - name: Generate the OS/Python matrix
+        id: generate
+        shell: bash
+        run: |
+          python3 - "$RUNNER_TEMP/versions-manifest.json" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          manifest_path = sys.argv[1]
+          with open(manifest_path, "r", encoding="utf-8") as stream:
+              manifest = json.load(stream)
+
+          # Track builds that setup-python can actually install, rather than
+          # guessing future version numbers or attempting unavailable builds.
+          # Manifest entries marked stable:false (alpha/beta/RC) are ignored.
+          version_pattern = re.compile(r"(\d+)\.(\d+)\.(\d+)$")
+          available = set()
+
+          for release in manifest:
+              if release.get("stable") is not True:
+                  continue
+
+              match = version_pattern.fullmatch(str(release.get("version", "")))
+              if not match:
+                  continue
+
+              major, minor, _patch = map(int, match.groups())
+              if (major, minor) < (3, 12):
+                  continue
+
+              for item in release.get("files", []):
+                  platform = item.get("platform")
+                  arch = item.get("arch")
+                  if platform in ("linux", "win32") and arch in (
+                      "x64",
+                      "x64-freethreaded",
+                  ):
+                      available.add((major, minor, platform, arch))
+
+          # Build rows explicitly so a platform is only scheduled when the
+          # matching binary exists in setup-python's published manifest.
+          runners = (
+              ("ubuntu-latest", "linux"),
+              ("windows-latest", "win32"),
+          )
+          versions = sorted({(major, minor) for major, minor, _, _ in available})
+          include = []
+
+          for runner, platform in runners:
+              for major, minor in versions:
+                  version = f"{major}.{minor}"
+                  if (major, minor, platform, "x64") in available:
+                      include.append({"os": runner, "python": version})
+                  if (major, minor, platform, "x64-freethreaded") in available:
+                      include.append({"os": runner, "python": version + "t"})
+
+          if not include:
+              raise SystemExit(
+                  "No stable CPython >= 3.12 builds found in setup-python's manifest"
+              )
+
+          matrix = {"include": include}
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(
+                  "matrix=" + json.dumps(matrix, separators=(",", ":")) + "\n"
+              )
+
+          readable = ", ".join(f"{row['os']} / Python {row['python']}" for row in include)
+          print(f"Discovered {len(include)} build combinations:")
+          print(readable)
+          PY
+
   build:
-    name: Build on ${{ matrix.os }}
+    name: Build on ${{ matrix.os }} / Python ${{ matrix.python }}
+    needs: discover
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest]
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
 
     steps:
       - name: Check out source
@@ -22,7 +116,6 @@ jobs:
         id: config
         shell: bash
         run: |
-          echo "python-version=$(jq -r '.python_version' build_config.json)" >> "$GITHUB_OUTPUT"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             echo "artifact-name=$(jq -r '.artifacts.windows_name' build_config.json)" >> "$GITHUB_OUTPUT"
             echo "artifact-pattern=$(jq -r '.artifacts.windows_pattern' build_config.json)" >> "$GITHUB_OUTPUT"
@@ -33,19 +126,28 @@ jobs:
           echo "build-dependencies=$(jq -r '.build_dependencies | join(" ")' build_config.json)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
-          python-version: ${{ steps.config.outputs.python-version }}
+          python-version: ${{ matrix.python }}
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
 
       - name: Install build dependencies
-        run: python -m pip install ${{ steps.config.outputs.build-dependencies }}
+        shell: bash
+        run: python -m pip install --upgrade ${{ steps.config.outputs.build-dependencies }}
+      - name: Ensure recent pybind11
+        run: python -m pip install --upgrade "pybind11>=3.1.0"
 
       - name: Build native extension
         run: python setup.py build_ext --inplace --force
 
+      - name: Smoke-test extension import
+        run: python -c "import backend; print('Imported:', backend.__doc__)"
+
       - name: Upload compiled extension
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.config.outputs.artifact-name }}
+          name: ${{ steps.config.outputs.artifact-name }}-py${{ matrix.python }}
           path: ${{ steps.config.outputs.artifact-pattern }}
           if-no-files-found: error
