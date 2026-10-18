@@ -4,6 +4,8 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  # Re-check the published toolchain manifest weekly so newly available stable
+  # CPython releases are built without editing this workflow.
   schedule:
     - cron: '17 8 * * 1'
 
@@ -35,13 +37,9 @@ jobs:
           import re
           import sys
 
-          manifest_path = sys.argv[1]
-          with open(manifest_path, "r", encoding="utf-8") as stream:
+          with open(sys.argv[1], "r", encoding="utf-8") as stream:
               manifest = json.load(stream)
 
-          # Track builds that setup-python can actually install, rather than
-          # guessing future version numbers or attempting unavailable builds.
-          # Manifest entries marked stable:false (alpha/beta/RC) are ignored.
           version_pattern = re.compile(r"(\d+)\.(\d+)\.(\d+)$")
           available = set()
 
@@ -66,8 +64,6 @@ jobs:
                   ):
                       available.add((major, minor, platform, arch))
 
-          # Build rows explicitly so a platform is only scheduled when the
-          # matching binary exists in setup-python's published manifest.
           runners = (
               ("ubuntu-latest", "linux"),
               ("windows-latest", "win32"),
@@ -90,13 +86,11 @@ jobs:
 
           matrix = {"include": include}
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(
-                  "matrix=" + json.dumps(matrix, separators=(",", ":")) + "\n"
-              )
+              output.write("matrix=" + json.dumps(matrix, separators=(",", ":")) + "\n")
 
-          readable = ", ".join(f"{row['os']} / Python {row['python']}" for row in include)
           print(f"Discovered {len(include)} build combinations:")
-          print(readable)
+          for row in include:
+              print(f"  {row['os']} / Python {row['python']}")
           PY
 
   build:
@@ -117,10 +111,8 @@ jobs:
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            echo "artifact-name=$(jq -r '.artifacts.windows_name' build_config.json)" >> "$GITHUB_OUTPUT"
             echo "artifact-pattern=$(jq -r '.artifacts.windows_pattern' build_config.json)" >> "$GITHUB_OUTPUT"
           else
-            echo "artifact-name=$(jq -r '.artifacts.linux_name' build_config.json)" >> "$GITHUB_OUTPUT"
             echo "artifact-pattern=$(jq -r '.artifacts.linux_pattern' build_config.json)" >> "$GITHUB_OUTPUT"
           fi
           echo "build-dependencies=$(jq -r '.build_dependencies | join(" ")' build_config.json)" >> "$GITHUB_OUTPUT"
@@ -136,6 +128,8 @@ jobs:
       - name: Install build dependencies
         shell: bash
         run: python -m pip install --upgrade ${{ steps.config.outputs.build-dependencies }}
+
+      # Override an older pybind11 pin so newer Python releases can use current support.
       - name: Ensure recent pybind11
         run: python -m pip install --upgrade "pybind11>=3.1.0"
 
@@ -145,9 +139,113 @@ jobs:
       - name: Smoke-test extension import
         run: python -c "import backend; print('Imported:', backend.__doc__)"
 
-      - name: Upload compiled extension
+      # One temporary artifact per matrix job. The package jobs below merge these
+      # into exactly two user-facing artifacts (Linux and Windows).
+      - name: Upload temporary build result
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.config.outputs.artifact-name }}-py${{ matrix.python }}
+          name: networking-v2-build-${{ matrix.os }}-py${{ matrix.python }}
           path: ${{ steps.config.outputs.artifact-pattern }}
           if-no-files-found: error
+          retention-days: 1
+
+  package:
+    name: Package ${{ matrix.target }} binaries
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux
+            runner_key: ubuntu-latest
+          - target: windows
+            runner_key: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Read final artifact name
+        id: config
+        shell: bash
+        run: |
+          name="$(jq -r --arg target '${{ matrix.target }}' '.artifacts[$target + "_name"]' build_config.json)"
+          if [[ -z "$name" || "$name" == "null" ]]; then
+            echo "No artifact name configured for target ${{ matrix.target }}" >&2
+            exit 1
+          fi
+          echo "artifact-name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Download this platform's build results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: networking-v2-build-${{ matrix.runner_key }}-*
+          path: dist
+          merge-multiple: false
+
+      - name: Check packaged files
+        shell: bash
+        run: |
+          if [[ ! -d dist ]] || ! find dist -type f -print -quit | grep -q .; then
+            echo "No compiled extension files downloaded for ${{ matrix.target }}" >&2
+            exit 1
+          fi
+          echo "Compiled files to package:"
+          find dist -type f -print
+
+      - name: Upload combined platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.config.outputs.artifact-name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  cleanup-intermediate-artifacts:
+    name: Remove temporary per-version artifacts
+    if: ${{ always() }}
+    needs:
+      - build
+      - package
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete temporary build artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const run_id = context.runId;
+            const prefix = "networking-v2-build-";
+            const allArtifacts = [];
+
+            // Collect all pages before deleting so pagination cannot skip entries.
+            for (let page = 1; ; page++) {
+              const response = await github.rest.actions.listWorkflowRunArtifacts({
+                owner,
+                repo,
+                run_id,
+                per_page: 100,
+                page,
+              });
+              allArtifacts.push(...response.data.artifacts);
+              if (response.data.artifacts.length < 100) break;
+            }
+
+            const temporary = allArtifacts.filter((artifact) =>
+              artifact.name.startsWith(prefix)
+            );
+
+            for (const artifact of temporary) {
+              core.info(`Deleting temporary artifact: ${artifact.name}`);
+              await github.rest.actions.deleteArtifact({
+                owner,
+                repo,
+                artifact_id: artifact.id,
+              });
+            }
+
+            core.info(`Deleted ${temporary.length} temporary artifact(s).`);
