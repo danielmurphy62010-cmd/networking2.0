@@ -4,10 +4,6 @@ on:
   push:
   pull_request:
   workflow_dispatch:
-  # Re-check the published toolchain manifest weekly so newly available stable
-  # CPython releases are built without editing this workflow.
-  schedule:
-    - cron: '17 8 * * 1'
 
 permissions:
   contents: read
@@ -184,21 +180,44 @@ jobs:
           path: dist
           merge-multiple: false
 
-      - name: Check packaged files
+      - name: Flatten compiled extensions into the ZIP root
         shell: bash
         run: |
+          set -euo pipefail
+          mkdir -p package-root
+
           if [[ ! -d dist ]] || ! find dist -type f -print -quit | grep -q .; then
             echo "No compiled extension files downloaded for ${{ matrix.target }}" >&2
             exit 1
           fi
-          echo "Compiled files to package:"
-          find dist -type f -print
+
+          # download-artifact creates a directory per temporary artifact. Copy
+          # each payload file by basename so the final ZIP has the .pyd/.so
+          # files directly at its root, rather than nested artifact folders.
+          while IFS= read -r -d '' file; do
+            name="${file##*/}"
+            destination="package-root/$name"
+            if [[ -e "$destination" ]]; then
+              echo "Refusing to overwrite duplicate filename while flattening: $name" >&2
+              echo "Source: $file" >&2
+              exit 1
+            fi
+            cp -- "$file" "$destination"
+          done < <(find dist -type f -print0)
+
+          if ! find package-root -maxdepth 1 -type f -print -quit | grep -q .; then
+            echo "No files available to package for ${{ matrix.target }}" >&2
+            exit 1
+          fi
+
+          echo "Files to be placed at the ZIP root:"
+          find package-root -maxdepth 1 -type f -printf '%f\n' | sort
 
       - name: Upload combined platform artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.config.outputs.artifact-name }}
-          path: dist/
+          path: package-root/*
           if-no-files-found: error
           retention-days: 30
 
