@@ -135,8 +135,7 @@ jobs:
       - name: Smoke-test extension import
         run: python -c "import backend; print('Imported:', backend.__doc__)"
 
-      # One temporary artifact per matrix job. The package jobs below merge these
-      # into exactly two user-facing artifacts (Linux and Windows).
+      # One temporary artifact per matrix job; the package job merges them.
       - name: Upload temporary build result
         uses: actions/upload-artifact@v4
         with:
@@ -146,78 +145,83 @@ jobs:
           retention-days: 1
 
   package:
-    name: Package ${{ matrix.target }} binaries
+    name: Package all compiled binaries
     needs: build
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: linux
-            runner_key: ubuntu-latest
-          - target: windows
-            runner_key: windows-latest
 
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Read final artifact name
-        id: config
-        shell: bash
-        run: |
-          name="$(jq -r --arg target '${{ matrix.target }}' '.artifacts[$target + "_name"]' build_config.json)"
-          if [[ -z "$name" || "$name" == "null" ]]; then
-            echo "No artifact name configured for target ${{ matrix.target }}" >&2
-            exit 1
-          fi
-          echo "artifact-name=$name" >> "$GITHUB_OUTPUT"
-
-      - name: Download this platform's build results
+      - name: Download all build results
         uses: actions/download-artifact@v4
         with:
-          pattern: networking-v2-build-${{ matrix.runner_key }}-*
+          pattern: networking-v2-build-*
           path: dist
           merge-multiple: false
 
-      - name: Flatten compiled extensions into the ZIP root
+      - name: Collect extensions and create one ZIP
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p package-root
 
-          if [[ ! -d dist ]] || ! find dist -type f -print -quit | grep -q .; then
-            echo "No compiled extension files downloaded for ${{ matrix.target }}" >&2
-            exit 1
-          fi
-
-          # download-artifact creates a directory per temporary artifact. Copy
-          # each payload file by basename so the final ZIP has the .pyd/.so
-          # files directly at its root, rather than nested artifact folders.
+          # Collect every .so and .pyd from all build jobs.
           while IFS= read -r -d '' file; do
             name="${file##*/}"
             destination="package-root/$name"
+
             if [[ -e "$destination" ]]; then
-              echo "Refusing to overwrite duplicate filename while flattening: $name" >&2
+              echo "Duplicate filename detected: $name" >&2
               echo "Source: $file" >&2
               exit 1
             fi
+
             cp -- "$file" "$destination"
-          done < <(find dist -type f -print0)
+          done < <(
+            find dist -type f \( -name '*.so' -o -name '*.pyd' \) -print0
+          )
 
           if ! find package-root -maxdepth 1 -type f -print -quit | grep -q .; then
-            echo "No files available to package for ${{ matrix.target }}" >&2
+            echo "No .so or .pyd files found." >&2
             exit 1
           fi
 
-          echo "Files to be placed at the ZIP root:"
+          echo "Extensions included in the ZIP:"
           find package-root -maxdepth 1 -type f -printf '%f\n' | sort
 
-      - name: Upload combined platform artifact
+          # Use Python's zipfile module to avoid shell-glob edge cases.
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+
+          root = Path("package-root")
+          files = sorted(
+              path for path in root.iterdir()
+              if path.is_file() and path.suffix in {".so", ".pyd"}
+          )
+          if not files:
+              raise SystemExit("No .so or .pyd files available to ZIP")
+
+          output = Path("backend-compiled.zip")
+          with ZipFile(output, "w", compression=ZIP_DEFLATED) as archive:
+              for path in files:
+                  archive.write(path, arcname=path.name)
+
+          with ZipFile(output, "r") as archive:
+              names = archive.namelist()
+              if len(names) != len(files) or any("/" in name for name in names):
+                  raise SystemExit("ZIP validation failed: unexpected paths or entries")
+              bad_file = archive.testzip()
+              if bad_file:
+                  raise SystemExit(f"ZIP validation failed for {bad_file}")
+
+          print(f"Created {output} with {len(files)} extension file(s).")
+          PY
+
+      - name: Upload the single ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.config.outputs.artifact-name }}
-          path: package-root/*
+          name: backend-compiled
+          path: backend-compiled.zip
           if-no-files-found: error
           retention-days: 30
 
