@@ -157,14 +157,14 @@ jobs:
           path: dist
           merge-multiple: false
 
-      - name: Collect extensions and create one ZIP
+      - name: Collect extensions into one flat directory
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p package-root
 
-          # Collect every .so and .pyd from all build jobs.
+          # Flatten all compiled extensions from every build job.
           while IFS= read -r -d '' file; do
             name="${file##*/}"
             destination="package-root/$name"
@@ -185,43 +185,17 @@ jobs:
             exit 1
           fi
 
-          echo "Extensions included in the ZIP:"
+          echo "Files that will appear at the ZIP root:"
           find package-root -maxdepth 1 -type f -printf '%f\n' | sort
 
-          # Use Python's zipfile module to avoid shell-glob edge cases.
-          python - <<'PY'
-          from pathlib import Path
-          from zipfile import ZIP_DEFLATED, ZipFile
-
-          root = Path("package-root")
-          files = sorted(
-              path for path in root.iterdir()
-              if path.is_file() and path.suffix in {".so", ".pyd"}
-          )
-          if not files:
-              raise SystemExit("No .so or .pyd files available to ZIP")
-
-          output = Path("backend-compiled.zip")
-          with ZipFile(output, "w", compression=ZIP_DEFLATED) as archive:
-              for path in files:
-                  archive.write(path, arcname=path.name)
-
-          with ZipFile(output, "r") as archive:
-              names = archive.namelist()
-              if len(names) != len(files) or any("/" in name for name in names):
-                  raise SystemExit("ZIP validation failed: unexpected paths or entries")
-              bad_file = archive.testzip()
-              if bad_file:
-                  raise SystemExit(f"ZIP validation failed for {bad_file}")
-
-          print(f"Created {output} with {len(files)} extension file(s).")
-          PY
-
-      - name: Upload the single ZIP
+      # GitHub Actions packages uploaded artifact files into one downloadable ZIP.
+      # Upload the binaries directly; do not create a ZIP here, or the download
+      # will contain a ZIP inside GitHub's artifact ZIP.
+      - name: Upload single downloadable artifact
         uses: actions/upload-artifact@v4
         with:
           name: backend-compiled
-          path: backend-compiled.zip
+          path: package-root/*
           if-no-files-found: error
           retention-days: 30
 
