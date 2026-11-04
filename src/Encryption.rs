@@ -990,7 +990,8 @@ pub fn gen_CA(
     builder.set_subject_name(&subject)?;
     builder.set_issuer_name(&subject)?;
     builder.set_pubkey(&public)?;
-    builder.set_serial_number(&random_serial_number()?)?;
+    let serial = random_serial_number()?;
+    builder.set_serial_number(&serial)?;
     builder.set_not_before(&not_before)?;
     builder.set_not_after(&not_after)?;
     builder.append_extension(BasicConstraints::new().critical().ca().build()?)?;
@@ -1038,7 +1039,8 @@ pub fn gen_keys(
     builder.set_subject_name(&subject)?;
     builder.set_issuer_name(issuer_cert.subject_name())?;
     builder.set_pubkey(&public)?;
-    builder.set_serial_number(&random_serial_number()?)?;
+    let serial = random_serial_number()?;
+    builder.set_serial_number(&serial)?;
     builder.set_not_before(&not_before)?;
     builder.set_not_after(&not_after)?;
     builder.append_extension(BasicConstraints::new().critical().build()?)?;

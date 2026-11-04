@@ -1912,9 +1912,11 @@ impl Client {
         }
     }
     fn connection(&self) -> Result<Arc<Connection>> {
-        let inner = self.upgrade()?;
+        if !self.inner.connected.load(Ordering::Acquire) {
+            return Err(BackendError::ConnectionClosed);
+        }
 
-        let connection = mutex_lock(&inner.conn).clone();
+        let connection = mutex_lock(&self.inner.conn).clone();
 
         connection.ok_or(BackendError::ConnectionClosed)
     }
@@ -2023,9 +2025,10 @@ impl ClientHandle {
     }
     fn connection(&self) -> Result<Arc<Connection>> {
         let inner = self.upgrade()?;
-        mutex_lock(&inner.conn)
-            .clone()
-            .ok_or(BackendError::ConnectionClosed)
+
+        let connection = mutex_lock(&inner.conn).clone();
+
+        connection.ok_or(BackendError::ConnectionClosed)
     }
     pub fn send(&self, data: Vec<u8>, requested_eid: Option<Eid>) -> Result<Eid> {
         let conn = self.connection()?;
