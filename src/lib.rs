@@ -96,11 +96,11 @@ impl Server {
     fn new(
         host: String,
         port: u16,
-        handshake_worker: Option<PyObject>,
-        on_exchange: Option<PyObject>,
+        handshake_worker: Option<Py<PyAny>>,
+        on_exchange: Option<Py<PyAny>>,
         simult_handshakes: usize,
         simult_exchanges: usize,
-        on_disconnect: Option<PyObject>,
+        on_disconnect: Option<Py<PyAny>>,
     ) -> Self {
         Server {
             host,
@@ -212,7 +212,7 @@ impl Client {
     #[new]
     #[pyo3(signature = (host, port, on_exchange=None, simult_exchanges=4))]
     #[allow(unused_variables)]
-    fn new(host: String, port: u16, on_exchange: Option<PyObject>, simult_exchanges: usize) -> PyResult<Self> {
+    fn new(host: String, port: u16, on_exchange: Option<Py<PyAny>>, simult_exchanges: usize) -> PyResult<Self> {
         let stream = TcpStream::connect(format!("{}:{}", host, port))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(Client {
