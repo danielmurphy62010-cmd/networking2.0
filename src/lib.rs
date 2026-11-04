@@ -272,7 +272,7 @@ impl Client {
 // --- Python Module Initialization ---
 
 #[pymodule]
-fn network(py: Python, m: &PyMdoule) -> PyResult<()> {
+fn network2(py: Python, m: &PyMdoule) -> PyResult<()> {
     m.add_class::<Server>()?;
     m.add_class::<Client>()?;
     m.add_function(wrap_pyfunction!(encrypt_gcm, m)?)?;
