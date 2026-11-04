@@ -78,10 +78,10 @@ fn decrypt_gcm(encrypted: &[u8], key: &[u8], aad: Option<&[u8]>) -> PyResult<Vec
     Ok(plaintext)
 }
 
-// --- Networking Server & Client Bindings ---
+// --- Networking TCPServer & TCPClient Bindings ---
 
 #[pyclass]
-struct Server {
+struct TCPServer {
     host: String,
     port: u16,
     running: Arc<Mutex<bool>>,
@@ -89,20 +89,21 @@ struct Server {
 }
 
 #[pymethods]
-impl Server {
+impl TCPServer {
     #[new]
-    #[pyo3(signature = (host, port, handshake_worker=None, on_exchange=None, simult_handshakes=4, simult_exchanges=4, on_disconnect=None))]
+    #[pyo3(signature = (host, port, password=None, handshake_worker=None, on_exchange=None, simult_handshakes=4, simult_exchanges=4, on_disconnect=None))]
     #[allow(unused_variables)]
     fn new(
         host: String,
         port: u16,
+        password: Option<Py<PyAny>>,
         handshake_worker: Option<Py<PyAny>>,
         on_exchange: Option<Py<PyAny>>,
         simult_handshakes: usize,
         simult_exchanges: usize,
         on_disconnect: Option<Py<PyAny>>,
     ) -> Self {
-        Server {
+        TCPServer {
             host,
             port,
             running: Arc::new(Mutex::new(false)),
@@ -149,7 +150,7 @@ impl Server {
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
             Ok(())
         } else {
-            Err(pyo3::exceptions::PyKeyError::new_err("Unknown client ID"))
+            Err(pyo3::exceptions::PyKeyError::new_err("Unknown TCPClient ID"))
         }
     }
 
@@ -169,7 +170,7 @@ impl Server {
             });
             Ok(res)
         } else {
-            Err(pyo3::exceptions::PyKeyError::new_err("Unknown client ID"))
+            Err(pyo3::exceptions::PyKeyError::new_err("Unknown TCPClient ID"))
         }
     }
 
@@ -201,21 +202,21 @@ impl Server {
 }
 
 #[pyclass]
-struct Client {
+struct TCPClient {
     stream: Option<TcpStream>,
     _host: String,
     _port: u16,
 }
 
 #[pymethods]
-impl Client {
+impl TCPClient {
     #[new]
     #[pyo3(signature = (host, port, on_exchange=None, simult_exchanges=4))]
     #[allow(unused_variables)]
     fn new(host: String, port: u16, on_exchange: Option<Py<PyAny>>, simult_exchanges: usize) -> PyResult<Self> {
         let stream = TcpStream::connect(format!("{}:{}", host, port))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        Ok(Client {
+        Ok(TCPClient {
             stream: Some(stream),
             _host: host,
             _port: port,
@@ -284,8 +285,8 @@ impl Client {
 
 #[pymodule]
 fn network2(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<Server>()?;
-    m.add_class::<Client>()?;
+    m.add_class::<TCPServer>()?;
+    m.add_class::<TCPClient>()?;
     m.add_function(wrap_pyfunction!(encrypt_gcm, m)?)?;
     m.add_function(wrap_pyfunction!(decrypt_gcm, m)?)?;
     Ok(())
