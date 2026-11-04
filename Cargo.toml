@@ -1,5 +1,5 @@
 [package]
-name = "network2"
+name = "network_rs"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,12 +8,12 @@ name = "network2"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "=0.21.2", features = ["extension-module"] }
+pyo3 = { version = "0.30.1", features = ["extension-module"] }
 aes-gcm = "0.10"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 x25519-dalek = { version = "3.0", features = ["static_secrets"] }
 argon2 = "0.5"
 blake3 = "1.5"
-rand = "=0.8.5"
+rand = "0.8"
 tokio = { version = "1.0", features = ["full"] }
 ring = "0.17"

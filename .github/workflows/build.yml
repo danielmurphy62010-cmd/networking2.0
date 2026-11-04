@@ -18,9 +18,9 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.14'
+          python-version: '3.14'   # Target Python 3.14
 
-      - name: Build Python extension with maturins
+      - name: Build Python extension with maturin
         uses: PyO3/maturin-action@v1
         with:
           args: --release --out dist

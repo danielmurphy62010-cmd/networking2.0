@@ -161,9 +161,10 @@ impl Server {
             if n == 0 {
                 return Ok(None);
             }
-            Python::with_gil(|py| {
-                Ok(Some(PyBytes::new(py, &buf[..n]).into()))
-            })
+            let res = Python::try_attach(|py| {
+                PyBytes::new(py, &buf[..n]).unbind()
+            });
+            Ok(res)
         } else {
             Err(pyo3::exceptions::PyKeyError::new_err("Unknown client ID"))
         }
@@ -238,9 +239,10 @@ impl Client {
             let n = stream.read(&mut buf)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
             if n == 0 { return Ok(None); }
-            Python::with_gil(|py| {
-                Ok(Some(PyBytes::new(py, &buf[..n]).into()))
-            })
+            let res = Python::try_attach(|py| {
+                PyBytes::new(py, &buf[..n]).unbind()
+            });
+            Ok(res)
         } else {
             Err(pyo3::exceptions::PyRuntimeError::new_err("Not connected"))
         }
@@ -270,7 +272,7 @@ impl Client {
 // --- Python Module Initialization ---
 
 #[pymodule]
-fn network2(_py: Python, m: &PyModule) -> PyResult<()> {
+fn network2(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Server>()?;
     m.add_class::<Client>()?;
     m.add_function(wrap_pyfunction!(encrypt_gcm, m)?)?;
