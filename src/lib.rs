@@ -92,14 +92,15 @@ struct Server {
 impl Server {
     #[new]
     #[pyo3(signature = (host, port, handshake_worker=None, on_exchange=None, simult_handshakes=4, simult_exchanges=4, on_disconnect=None))]
+    #[allow(unused_variables)]
     fn new(
         host: String,
         port: u16,
-        _handshake_worker: Option<PyObject>,
-        _on_exchange: Option<PyObject>,
-        _simult_handshakes: usize,
-        _simult_exchanges: usize,
-        _on_disconnect: Option<PyObject>,
+        handshake_worker: Option<PyObject>,
+        on_exchange: Option<PyObject>,
+        simult_handshakes: usize,
+        simult_exchanges: usize,
+        on_disconnect: Option<PyObject>,
     ) -> Self {
         Server {
             host,
@@ -139,7 +140,8 @@ impl Server {
     }
 
     #[pyo3(signature = (data, cid, eid=None))]
-    fn send(&self, data: &[u8], cid: &[u8], _eid: Option<&[u8]>) -> PyResult<()> {
+    #[allow(unused_variables)]
+    fn send(&self, data: &[u8], cid: &[u8], eid: Option<&[u8]>) -> PyResult<()> {
         let key = String::from_utf8_lossy(cid).to_string();
         let mut conns = self.connections.lock().unwrap();
         if let Some(stream) = conns.get_mut(&key) {
@@ -151,7 +153,8 @@ impl Server {
         }
     }
 
-    fn recv(&self, cid: &[u8], _eid: Option<&[u8]>, _timeout: Option<f64>) -> PyResult<Option<Py<PyBytes>>> {
+    #[allow(unused_variables)]
+    fn recv(&self, cid: &[u8], eid: Option<&[u8]>, timeout: Option<f64>) -> PyResult<Option<Py<PyBytes>>> {
         let key = String::from_utf8_lossy(cid).to_string();
         let mut conns = self.connections.lock().unwrap();
         if let Some(stream) = conns.get_mut(&key) {
@@ -178,7 +181,8 @@ impl Server {
         self.recv(temp_cid, None, timeout)
     }
 
-    fn auth_finished(&self, _temp_cid: &[u8], _new_cid: &[u8], _confirmation_payload: Option<&[u8]>) -> PyResult<bool> {
+    #[allow(unused_variables)]
+    fn auth_finished(&self, temp_cid: &[u8], new_cid: &[u8], confirmation_payload: Option<&[u8]>) -> PyResult<bool> {
         Ok(true)
     }
 
@@ -188,9 +192,12 @@ impl Server {
     #[getter]
     fn magic2(&self) -> PyResult<Vec<u8>> { Ok(b"MAGIC456".to_vec()) }
     
-    fn is_authed(&self, _cid: &[u8]) -> bool { true }
-    fn set_backpressure(&self, _cid: &[u8], _value: bool) {}
-    fn close_client(&self, _cid: &[u8]) {}
+    #[allow(unused_variables)]
+    fn is_authed(&self, cid: &[u8]) -> bool { true }
+    #[allow(unused_variables)]
+    fn set_backpressure(&self, cid: &[u8], value: bool) {}
+    #[allow(unused_variables)]
+    fn close_client(&self, cid: &[u8]) {}
 }
 
 #[pyclass]
@@ -204,7 +211,8 @@ struct Client {
 impl Client {
     #[new]
     #[pyo3(signature = (host, port, on_exchange=None, simult_exchanges=4))]
-    fn new(host: String, port: u16, _on_exchange: Option<PyObject>, _simult_exchanges: usize) -> PyResult<Self> {
+    #[allow(unused_variables)]
+    fn new(host: String, port: u16, on_exchange: Option<PyObject>, simult_exchanges: usize) -> PyResult<Self> {
         let stream = TcpStream::connect(format!("{}:{}", host, port))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(Client {
@@ -219,7 +227,8 @@ impl Client {
     }
 
     #[pyo3(signature = (data, eid=None))]
-    fn send(&mut self, data: &[u8], _eid: Option<&[u8]>) -> PyResult<()> {
+    #[allow(unused_variables)]
+    fn send(&mut self, data: &[u8], eid: Option<&[u8]>) -> PyResult<()> {
         if let Some(ref mut stream) = self.stream {
             stream.write_all(data)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -233,7 +242,8 @@ impl Client {
         self.send(data, None)
     }
 
-    fn recv(&mut self, _eid: Option<&[u8]>, _timeout: Option<f64>) -> PyResult<Option<Py<PyBytes>>> {
+    #[allow(unused_variables)]
+    fn recv(&mut self, eid: Option<&[u8]>, timeout: Option<f64>) -> PyResult<Option<Py<PyBytes>>> {
         if let Some(ref mut stream) = self.stream {
             let mut buf = vec![0u8; 4096];
             let n = stream.read(&mut buf)
@@ -266,7 +276,8 @@ impl Client {
     #[getter]
     fn magic2(&self) -> PyResult<Vec<u8>> { Ok(b"MAGIC456".to_vec()) }
 
-    fn set_backpressure(&self, _value: bool) {}
+    #[allow(unused_variables)]
+    fn set_backpressure(&self, value: bool) {}
 }
 
 // --- Python Module Initialization ---
