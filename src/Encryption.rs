@@ -746,7 +746,7 @@ fn ec_public_signature_digest(key: &PKey<Public>) -> Result<MessageDigest> {
         _ => MessageDigest::sha256(),
     })
 }
-pub fn sign(prv: &[u8], data: &[u8]) -> Result<Vec<u8>> { The Python implementation first attempts framed Ed25519/Ed448, swallowing any error before falling back to DER/PEM EC or RSA keys.
+pub fn sign(prv: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     if detect_key_type(prv, Some(&["ed25519", "ed448"]), Some(true), true)?.is_some() {
         if let Ok(packet) = ed25519_sign(prv, data) {
             return Ok(packet);
@@ -783,7 +783,7 @@ pub fn verify(pub_key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     let signed_len = i64::from_be_bytes(data[..8].try_into().unwrap());
     if signed_len >= 0 && data.len() < 8usize.saturating_add(signed_len as usize) {
         bail!("Invalid signature packet length");
-    } This order mirrors the Python source: the generic 8-byte packet-length check happens before the framed EdDSA branch.
+    }
     if detect_key_type(pub_key, Some(&["ed25519", "ed448"]), Some(false), true)?.is_some() {
         if let Ok(message) = ed25519_verify(pub_key, data) {
             return Ok(message);
