@@ -25,6 +25,6 @@ blake3 = "1"
 chacha20poly1305 = "0.10"
 ctr = "0.9"
 hkdf = "0.12"
-openssl = "0.10"
+openssl = { version = "0.10", features = ["vendored"] }
 sha2 = "0.10"
 subtle = "2"
