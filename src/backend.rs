@@ -1912,12 +1912,11 @@ impl Client {
         }
     }
     fn connection(&self) -> Result<Arc<Connection>> {
-        if !self.inner.connected.load(Ordering::Acquire) {
-            return Err(BackendError::ConnectionClosed);
-        }
-        mutex_lock(&self.inner.conn)
-            .clone()
-            .ok_or(BackendError::ConnectionClosed)
+        let inner = self.upgrade()?;
+
+        let connection = mutex_lock(&inner.conn).clone();
+
+        connection.ok_or(BackendError::ConnectionClosed)
     }
     pub fn close(&self) {
         if self.inner.stopping.swap(true, Ordering::AcqRel) {
