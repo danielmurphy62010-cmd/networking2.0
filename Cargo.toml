@@ -1,30 +1,31 @@
 [package]
-name = "backend_encryption_test"
+name = "network2"
 version = "0.1.0"
 edition = "2021"
-
 [lib]
-path = "src/lib.rs"
-
+name = "network2"
+crate-type = ["cdylib", "rlib"]
 [dependencies]
-# backend.rs
-async-channel = "2"
+tokio = { version = "1.0", features = ["full"] }
+async-channel = "1.9"
 futures = "0.3"
+thiserror = "1.0"
+socket2 = "0.5"
+tokio-util = "0.7"
 rand = "0.8"
-socket2 = "0.6"
-thiserror = "2"
-tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-
-# Encryption.rs
 aes = "0.8"
 aes-gcm = "0.10"
-anyhow = "1"
 argon2 = "0.5"
-blake3 = "1"
-chacha20poly1305 = "0.10"
-ctr = "0.9"
+blake3 = "1.5"
+chacha20poly1305 = "0.9"
 hkdf = "0.12"
 openssl = { version = "0.10", features = ["vendored"] }
-sha2 = "0.10"
-subtle = "2"
+subtle = "2.5"
+pyo3 = { version = "0.21", features = ["extension-module"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+totp-rs = "5.0"
+zxcvbn = "2.2"
+base64 = "0.21"
+hex = "0.4"
+rpassword = "7.3"
