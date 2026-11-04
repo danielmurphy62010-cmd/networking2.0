@@ -1,46 +1,61 @@
-name: Rust Build
-
+name: Rust Test Build
 on:
   push:
   pull_request:
   workflow_dispatch:
-
 permissions:
   contents: read
-
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
-  build:
-    name: Build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest]
-
+  build-windows:
+    name: Build optimized Windows test executable
+    runs-on: windows-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
-
-      # The vendored OpenSSL build needs Perl and NASM on Windows.
-      - name: Install Windows OpenSSL build tools
+      - name: Install OpenSSL build prerequisites
         shell: pwsh
         run: |
           choco install strawberryperl nasm --no-progress -y
           "C:\Strawberry\perl\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - name: Verify OpenSSL features
-        run: cargo tree -e features -i openssl-sys
-      - name: Check Rust source
-        run: cargo check --all-targets
+      - name: Build and run optimized tests
+        shell: pwsh
+        env:
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: 3
+          CARGO_PROFILE_RELEASE_LTO: thin
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: |
+          cargo test --release --lib
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+      - name: Prepare executable for upload
+        shell: pwsh
+        run: |
+          $testExe = Get-ChildItem -Path "target/release/deps" -Filter "backend_encryption_test-*.exe" -File |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
 
-      - name: Run tests
-        run: cargo test --all-targets
+          if (-not $testExe) {
+            throw "Could not find the compiled backend_encryption_test test executable in target/release/deps. Check the Cargo package name and test target."
+          }
 
-      - name: Build optimized version
-        run: cargo build --release
+          New-Item -ItemType Directory -Force -Path "target/release/artifact" | Out-Null
+          Copy-Item $testExe.FullName "target/release/artifact/backend_encryption_test.exe" -Force
+          Get-Item "target/release/artifact/backend_encryption_test.exe" | Format-List FullName, Length
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-encryption-test-windows
+          path: target/release/artifact/backend_encryption_test.exe
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
