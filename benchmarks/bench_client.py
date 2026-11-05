@@ -97,6 +97,9 @@ def single_bandwidth_test(client, size: int, direction: str, samples: int) -> di
 
 
 def continuous_test(client, size: int, direction: str, duration: float) -> dict:
+    # Keep a bounded batch in flight: continuous throughput should not be
+    # constrained to one request/response round trip at a time.
+    window = 4
     deadline = time.perf_counter() + duration
     total_bytes = 0
     messages = 0
@@ -104,20 +107,27 @@ def continuous_test(client, size: int, direction: str, duration: float) -> dict:
         payload = b"U" + bytes(size - 1)
     else:
         payload = b"D" + size.to_bytes(8, "big")
+
     start = time.perf_counter()
     while time.perf_counter() < deadline:
-        response, _ = roundtrip(client, payload, timeout=max(30.0, duration * 4))
-        if direction == "upload":
-            if response != b"ACK":
-                raise RuntimeError("upload ACK mismatch")
-        elif len(response) != size:
-            raise RuntimeError("download length mismatch")
-        total_bytes += size
-        messages += 1
+        pending = [client.send(payload) for _ in range(window)]
+        for eid in pending:
+            response = client.recv(eid, timeout=max(30.0, duration * 4))
+            if response is None:
+                raise TimeoutError(f"continuous {direction} response timed out")
+            if direction == "upload":
+                if bytes(response) != b"ACK":
+                    raise RuntimeError("upload ACK mismatch")
+            elif len(response) != size:
+                raise RuntimeError("download length mismatch")
+            total_bytes += size
+            messages += 1
+
     elapsed = time.perf_counter() - start
     return {
         "test": f"continuous_{direction}_bandwidth",
         "size_bytes": size,
+        "window": window,
         "duration_s": elapsed,
         "messages": messages,
         "total_mib": total_bytes / (1024 * 1024),
