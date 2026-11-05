@@ -724,7 +724,8 @@ impl Connection {
             } else if state.input.capacity() > 1024 * 1024
                 && state.input.len() < state.input.capacity() / 8
             {
-                state.input.shrink_to(state.input.len().max(4096));
+                let target_capacity = state.input.len().max(4096);
+                state.input.shrink_to(target_capacity);
             }
             if state.input.len() > MAX_INPUT_BUFFER {
                 should_close = true;
