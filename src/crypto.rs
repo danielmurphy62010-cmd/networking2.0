@@ -1,26 +1,23 @@
 //! Wire-compatible cryptographic primitives used by network.py.
 //!
-//! Deliberately excludes the unrelated CA/TLS/AES-CTR/ChaCha helpers from
-//! Encryption.py.  The protocol path uses X448, Ed448, BLAKE3, Argon2id and
-//! AES-256-GCM only.
+//! Uses pure-Rust curve implementations for X25519/X448 and Ed25519/Ed448 so
+//! Windows builds do not require a separately installed OpenSSL SDK.
 
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
+use cx448::{Signature as Ed448Signature, SigningKey as Ed448SigningKey, VerifyingKey as Ed448VerifyingKey};
 use data_encoding::BASE32_NOPAD;
+use ed25519_dalek::{Signature as Ed25519Signature, SigningKey as Ed25519SigningKey, VerifyingKey as Ed25519VerifyingKey};
 use getrandom::getrandom;
 use hmac::{Hmac, Mac};
-use openssl::{
-    derive::Deriver,
-    pkey::{Id, PKey, Private, Public},
-    sign::{Signer, Verifier},
-};
 use sha1::Sha1;
 use std::time::{SystemTime, UNIX_EPOCH};
-use thiserror::Error;
 use subtle::ConstantTimeEq;
+use thiserror::Error;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 
 pub const SALT_SIZE: usize = 64;
 pub const AES_GCM_IV_SIZE: usize = 12;
@@ -50,16 +47,8 @@ pub enum CryptoError {
     InvalidSalt,
     #[error("random source failed: {0}")]
     Random(String),
-    #[error("cryptographic operation failed: {0}")]
-    OpenSsl(String),
     #[error("KDF failed: {0}")]
     Kdf(String),
-}
-
-impl From<openssl::error::ErrorStack> for CryptoError {
-    fn from(value: openssl::error::ErrorStack) -> Self {
-        Self::OpenSsl(value.to_string())
-    }
 }
 
 pub type CryptoResult<T> = Result<T, CryptoError>;
@@ -87,15 +76,6 @@ impl KeyKind {
             Self::X25519 | Self::Ed25519 => 32,
             Self::X448 => 56,
             Self::Ed448 => 57,
-        }
-    }
-
-    fn openssl_id(self) -> Id {
-        match self {
-            Self::X25519 => Id::X25519,
-            Self::Ed25519 => Id::ED25519,
-            Self::X448 => Id::X448,
-            Self::Ed448 => Id::ED448,
         }
     }
 
@@ -195,16 +175,58 @@ pub fn derive_at_rest_key(password: &str, salt: &[u8]) -> CryptoResult<Vec<u8>> 
     kdf_slow(password.as_bytes(), salt)
 }
 
+fn to_array<const N: usize>(raw: &[u8]) -> CryptoResult<[u8; N]> {
+    raw.try_into().map_err(|_| CryptoError::InvalidKey)
+}
+
+fn x448_secret(raw: &[u8]) -> CryptoResult<cx448::x448::Secret> {
+    cx448::x448::Secret::from_bytes(raw).ok_or(CryptoError::InvalidKey)
+}
+
+fn ed448_signing_key(raw: &[u8]) -> CryptoResult<Ed448SigningKey> {
+    Ed448SigningKey::try_from(raw).map_err(|_| CryptoError::InvalidKey)
+}
+
 pub fn generate_keypair(kind: KeyKind) -> CryptoResult<(Vec<u8>, Vec<u8>)> {
-    let pkey = match kind {
-        KeyKind::X25519 => PKey::generate_x25519()?,
-        KeyKind::Ed25519 => PKey::generate_ed25519()?,
-        KeyKind::X448 => PKey::generate_x448()?,
-        KeyKind::Ed448 => PKey::generate_ed448()?,
-    };
-    let private = pkey.raw_private_key()?;
-    let public = pkey.raw_public_key()?;
-    Ok((frame_key(kind, true, &private), frame_key(kind, false, &public)))
+    match kind {
+        KeyKind::X25519 => {
+            let raw = to_array::<32>(&random_bytes(32)?)?;
+            let private = X25519StaticSecret::from(raw);
+            let public = X25519PublicKey::from(&private);
+            Ok((
+                frame_key(kind, true, private.as_bytes()),
+                frame_key(kind, false, public.as_bytes()),
+            ))
+        }
+        KeyKind::Ed25519 => {
+            let raw = to_array::<32>(&random_bytes(32)?)?;
+            let private = Ed25519SigningKey::from_bytes(&raw);
+            let public = private.verifying_key().to_bytes();
+            Ok((
+                frame_key(kind, true, private.as_bytes()),
+                frame_key(kind, false, &public),
+            ))
+        }
+        KeyKind::X448 => {
+            let raw = random_bytes(56)?;
+            let private = x448_secret(&raw)?;
+            let public = cx448::x448::PublicKey::from(&private);
+            Ok((
+                frame_key(kind, true, private.as_bytes()),
+                frame_key(kind, false, public.as_bytes()),
+            ))
+        }
+        KeyKind::Ed448 => {
+            let raw = random_bytes(57)?;
+            let private = ed448_signing_key(&raw)?;
+            let public = private.verifying_key().to_bytes();
+            let private_bytes = private.to_bytes();
+            Ok((
+                frame_key(kind, true, &private_bytes),
+                frame_key(kind, false, &public),
+            ))
+        }
+    }
 }
 
 pub fn frame_key(kind: KeyKind, private: bool, raw: &[u8]) -> Vec<u8> {
@@ -235,49 +257,63 @@ pub fn parse_framed_key(
     Ok((kind, private, &framed[1..]))
 }
 
-fn private_key(framed: &[u8], expected: Option<KeyKind>) -> CryptoResult<PKey<Private>> {
-    let (kind, is_private, raw) = parse_framed_key(framed, expected, Some(true))?;
-    if !is_private {
-        return Err(CryptoError::WrongKeyKind);
-    }
-    Ok(PKey::private_key_from_raw_bytes(raw, kind.openssl_id())?)
-}
-
-fn public_key(framed: &[u8], expected: Option<KeyKind>) -> CryptoResult<PKey<Public>> {
-    let (kind, is_private, raw) = parse_framed_key(framed, expected, Some(false))?;
-    if is_private {
-        return Err(CryptoError::WrongKeyKind);
-    }
-    Ok(PKey::public_key_from_raw_bytes(raw, kind.openssl_id())?)
-}
-
 pub fn get_pub(framed_private: &[u8]) -> CryptoResult<Vec<u8>> {
-    let private = private_key(framed_private, None)?;
-    let (kind, _, _) = parse_framed_key(framed_private, None, Some(true))?;
-    Ok(frame_key(kind, false, &private.raw_public_key()?))
+    let (kind, _, raw) = parse_framed_key(framed_private, None, Some(true))?;
+    let public = match kind {
+        KeyKind::X25519 => {
+            let private = X25519StaticSecret::from(to_array::<32>(raw)?);
+            X25519PublicKey::from(&private).as_bytes().to_vec()
+        }
+        KeyKind::Ed25519 => {
+            let private = Ed25519SigningKey::from_bytes(&to_array::<32>(raw)?);
+            private.verifying_key().to_bytes().to_vec()
+        }
+        KeyKind::X448 => {
+            let private = x448_secret(raw)?;
+            cx448::x448::PublicKey::from(&private).as_bytes().to_vec()
+        }
+        KeyKind::Ed448 => ed448_signing_key(raw)?.verifying_key().to_bytes().to_vec(),
+    };
+    Ok(frame_key(kind, false, &public))
 }
 
 pub fn shared_secret(my_private: &[u8], peer_public: &[u8]) -> CryptoResult<Vec<u8>> {
-    let (my_kind, _, _) = parse_framed_key(my_private, None, Some(true))?;
-    let (peer_kind, _, _) = parse_framed_key(peer_public, None, Some(false))?;
+    let (my_kind, _, my_raw) = parse_framed_key(my_private, None, Some(true))?;
+    let (peer_kind, _, peer_raw) = parse_framed_key(peer_public, None, Some(false))?;
     if my_kind != peer_kind || !matches!(my_kind, KeyKind::X25519 | KeyKind::X448) {
         return Err(CryptoError::WrongAlgorithm);
     }
-    let private = private_key(my_private, Some(my_kind))?;
-    let public = public_key(peer_public, Some(peer_kind))?;
-    let mut deriver = Deriver::new(&private)?;
-    deriver.set_peer(&public)?;
-    Ok(deriver.derive_to_vec()?)
+
+    match my_kind {
+        KeyKind::X25519 => {
+            let private = X25519StaticSecret::from(to_array::<32>(my_raw)?);
+            let public = X25519PublicKey::from(to_array::<32>(peer_raw)?);
+            Ok(private.diffie_hellman(&public).to_bytes().to_vec())
+        }
+        KeyKind::X448 => {
+            let private = x448_secret(my_raw)?;
+            let public = cx448::x448::PublicKey::from_bytes(peer_raw)
+                .ok_or(CryptoError::InvalidKey)?;
+            let shared = private
+                .as_diffie_hellman(&public)
+                .ok_or(CryptoError::AuthenticationFailed)?;
+            Ok(shared.as_bytes().to_vec())
+        }
+        _ => Err(CryptoError::WrongAlgorithm),
+    }
 }
 
 pub fn ed25519_sign(framed_private: &[u8], data: &[u8]) -> CryptoResult<Vec<u8>> {
-    let (kind, _, _) = parse_framed_key(framed_private, None, Some(true))?;
-    if !matches!(kind, KeyKind::Ed25519 | KeyKind::Ed448) {
-        return Err(CryptoError::WrongAlgorithm);
-    }
-    let private = private_key(framed_private, Some(kind))?;
-    let mut signer = Signer::new_without_digest(&private)?;
-    let signature = signer.sign_oneshot_to_vec(data)?;
+    let (kind, _, raw) = parse_framed_key(framed_private, None, Some(true))?;
+    let signature = match kind {
+        KeyKind::Ed25519 => {
+            let private = Ed25519SigningKey::from_bytes(&to_array::<32>(raw)?);
+            use ed25519_dalek::Signer as _;
+            private.sign(data).to_bytes().to_vec()
+        }
+        KeyKind::Ed448 => ed448_signing_key(raw)?.sign_raw(data).to_bytes().to_vec(),
+        _ => return Err(CryptoError::WrongAlgorithm),
+    };
     let mut output = Vec::with_capacity(signature.len() + data.len());
     output.extend_from_slice(&signature);
     output.extend_from_slice(data);
@@ -285,22 +321,35 @@ pub fn ed25519_sign(framed_private: &[u8], data: &[u8]) -> CryptoResult<Vec<u8>>
 }
 
 pub fn ed25519_verify(framed_public: &[u8], signed: &[u8]) -> CryptoResult<Vec<u8>> {
-    let (kind, _, _) = parse_framed_key(framed_public, None, Some(false))?;
-    if !matches!(kind, KeyKind::Ed25519 | KeyKind::Ed448) {
-        return Err(CryptoError::WrongAlgorithm);
-    }
+    let (kind, _, raw) = parse_framed_key(framed_public, None, Some(false))?;
     let signature_len = match kind {
         KeyKind::Ed448 => 114,
         KeyKind::Ed25519 => 64,
-        _ => unreachable!(),
+        _ => return Err(CryptoError::WrongAlgorithm),
     };
     if signed.len() < signature_len {
         return Err(CryptoError::AuthenticationFailed);
     }
     let (signature, data) = signed.split_at(signature_len);
-    let public = public_key(framed_public, Some(kind))?;
-    let mut verifier = Verifier::new_without_digest(&public)?;
-    if !verifier.verify_oneshot(signature, data)? {
+
+    let verified = match kind {
+        KeyKind::Ed25519 => {
+            let public = Ed25519VerifyingKey::from_bytes(&to_array::<32>(raw)?)
+                .map_err(|_| CryptoError::InvalidKey)?;
+            let signature = Ed25519Signature::from_bytes(&to_array::<64>(signature)?);
+            public.verify_strict(data, &signature).is_ok()
+        }
+        KeyKind::Ed448 => {
+            let public = Ed448VerifyingKey::from_bytes(&to_array::<57>(raw)?)
+                .map_err(|_| CryptoError::InvalidKey)?;
+            let signature = Ed448Signature::from_bytes(&to_array::<114>(signature)?)
+                .map_err(|_| CryptoError::AuthenticationFailed)?;
+            public.verify_raw(&signature, data).is_ok()
+        }
+        _ => return Err(CryptoError::WrongAlgorithm),
+    };
+
+    if !verified {
         return Err(CryptoError::AuthenticationFailed);
     }
     Ok(data.to_vec())
