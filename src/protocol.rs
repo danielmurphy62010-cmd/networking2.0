@@ -34,7 +34,7 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(10);
 // may opt into longer windows because the Argon2id handshake KDF is expensive.
 const HANDSHAKE_FIRST_TIMEOUT: Duration = Duration::from_secs(1);
 const HANDSHAKE_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-const EXCHANGE_CALLBACK_TIMEOUT: Duration = Duration::from_secs(1);
+const EXCHANGE_CALLBACK_TIMEOUT: Duration = Duration::from_secs(10);
 const ADMIN_PREFIX: &[u8; 9] = b"REQ_ADMIN";
 
 fn configured_timeout(env_name: &str, fallback: Duration) -> Duration {
@@ -52,6 +52,13 @@ fn handshake_first_timeout() -> Duration {
 
 fn handshake_default_timeout() -> Duration {
     configured_timeout("NETWORK2_HANDSHAKE_DEFAULT_TIMEOUT_MS", HANDSHAKE_DEFAULT_TIMEOUT)
+}
+
+fn exchange_callback_timeout() -> Duration {
+    configured_timeout(
+        "NETWORK2_EXCHANGE_CALLBACK_TIMEOUT_MS",
+        EXCHANGE_CALLBACK_TIMEOUT,
+    )
 }
 
 #[derive(Debug, Error)]
@@ -613,8 +620,23 @@ impl ProtocolServer {
     }
 
     fn dispatch_exchange(&self, cid: Vec<u8>, eid: [u8; 8]) {
-        let Ok(Some(data)) = self.recv_internal(&cid, &eid, Some(EXCHANGE_CALLBACK_TIMEOUT)) else {
-            return;
+        let timeout = exchange_callback_timeout();
+        let data = match self.recv_internal(&cid, &eid, Some(timeout)) {
+            Ok(Some(data)) => data,
+            Ok(None) => {
+                eprintln!(
+                    "network2: timed out waiting for first payload before on_exchange callback (client_id {}, EID {}, timeout {} ms)",
+                    hex::encode(&cid), hex::encode(eid), timeout.as_millis()
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!(
+                    "network2: failed to receive first payload before on_exchange callback (client_id {}, EID {}): {}",
+                    hex::encode(&cid), hex::encode(eid), error
+                );
+                return;
+            }
         };
         let Some(callback) = self.callback.as_ref() else {
             return;
@@ -629,10 +651,28 @@ impl ProtocolServer {
                 .map(|value| value.clone_ref(py));
             (cb, weak)
         });
-        let Some(weak_server_object) = weak_server_object else { return };
+        let Some(weak_server_object) = weak_server_object else {
+            eprintln!(
+                "network2: cannot dispatch on_exchange callback for client_id {} (EID {}): Python server object is unavailable",
+                hex::encode(&cid), hex::encode(eid)
+            );
+            return;
+        };
         Python::attach(|py| {
-            let Ok(server_object) = weak_server_object.bind(py).call0() else { return };
+            let server_object = match weak_server_object.bind(py).call0() {
+                Ok(value) => value,
+                Err(error) => {
+                    eprintln!(
+                        "network2: failed to resolve Python server object for on_exchange callback: {error}"
+                    );
+                    return;
+                }
+            };
             if server_object.is_none() {
+                eprintln!(
+                    "network2: Python server object was dropped before on_exchange callback (client_id {}, EID {})",
+                    hex::encode(&cid), hex::encode(eid)
+                );
                 return;
             }
             let result = callback.bind(py).call1((
