@@ -99,7 +99,7 @@ def single_bandwidth_test(client, size: int, direction: str, samples: int) -> di
 def continuous_test(client, size: int, direction: str, duration: float) -> dict:
     # Keep a bounded batch in flight: continuous throughput should not be
     # constrained to one request/response round trip at a time.
-    window = 4
+    window = 2
     deadline = time.perf_counter() + duration
     total_bytes = 0
     messages = 0
@@ -189,13 +189,28 @@ def aggregate(worker_results: list[dict], clients: int) -> list[dict]:
 
     output = []
     for (test, size), rows in grouped.items():
-        combined = {"clients": clients, "test": test, "size_bytes": size}
-        for field in ("median_ms", "p95_ms", "min_ms", "median_mib_s",
-                      "median_latency_ms", "mib_s", "total_mib", "messages"):
+        combined = {
+            "clients": clients,
+            "test": test,
+            "size_bytes": size,
+            "workers_completed": len(rows),
+        }
+        for field in ("median_ms", "p95_ms", "min_ms", "median_latency_ms"):
             values = [row[field] for row in rows if field in row]
             if values:
                 combined[field] = statistics.mean(values)
-        combined["workers_completed"] = len(rows)
+
+        # Throughput is reported both per process and as the sum across all
+        # successful client processes in this concurrency run.
+        for field in ("median_mib_s", "mib_s"):
+            values = [row[field] for row in rows if field in row]
+            if values:
+                combined["mean_client_" + field] = statistics.mean(values)
+                combined["aggregate_mib_s"] = sum(values)
+        for field in ("total_mib", "messages"):
+            values = [row[field] for row in rows if field in row]
+            if values:
+                combined[field] = sum(values)
         output.append(combined)
     return output
 
