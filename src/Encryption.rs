@@ -9,6 +9,7 @@ use argon2::{Algorithm as ArgonAlgorithm, Argon2, Params as ArgonParams, Version
 use blake3::Hasher as Blake3Hasher;
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use hkdf::Hkdf;
+use chacha20poly1305::aead::NewAead;
 use openssl::{
     asn1::{Asn1Integer, Asn1Time},
     bn::{BigNum, MsbOption},

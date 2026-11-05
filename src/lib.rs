@@ -55,7 +55,7 @@ fn derive_at_rest_key(password: &str, salt_path: &str) -> Result<Vec<u8>, Protoc
         return Err(ProtocolError::new("Password cannot be empty.".into()));
     }
     let z_res = zxcvbn::zxcvbn(password, &[]);
-    let guesses_log10 = z_res.guesses_log10();
+    let guesses_log10 = z_res?.guesses_log10();
     if guesses_log10 <= 9.0 {
         return Err(ProtocolError::new(format!(
             "Password too weak (log10 guesses: {:.2}). Must be > 9.",
@@ -88,9 +88,9 @@ pub struct TCPServer {
     signing_keys: (Vec<u8>, Vec<u8>),
     enable_bootstrap: Arc<Mutex<bool>>,
     keys: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
-    counters: Arc<Mutex<HashMap<Vec<u8>, [u64; 2]>>>>,
+    counters: Arc<Mutex<HashMap<Vec<u8>, [u64; 2]>>>,
     admin: Arc<Mutex<HashMap<Vec<u8>, bool>>>,
-    usernames: Arc<Mutex<HashMap<Vec<u8>, String>>>>,
+    usernames: Arc<Mutex<HashMap<Vec<u8>, String>>>,
     pending_bootstrap_totp: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
     admin_totp_path: String,
     bootstrap_totp_path: String,
@@ -493,7 +493,7 @@ impl TCPClient {
         port: u16,
         password: String,
         admin_auth_code: Option<String>,
-        _on_exchange: Option<PyObject>,
+        on_exchange: Option<PyObject>,
         simult_exchanges: usize,
     ) -> PyResult<Self> {
         let rt = Runtime::new()
