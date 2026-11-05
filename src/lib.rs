@@ -40,6 +40,11 @@ impl From<String> for ProtocolError {
         Self { message }
     }
 }
+impl From<zxcvbn::ZxcvbnError> for ProtocolError {
+    fn from(err: zxcvbn::ZxcvbnError) -> Self {
+        Self { message: err.to_string() }
+    }
+}
 impl From<backend::BackendError> for ProtocolError {
     fn from(err: backend::BackendError) -> Self {
         Self { message: err.to_string() }
