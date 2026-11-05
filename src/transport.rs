@@ -125,7 +125,9 @@ impl WorkerPool {
                 };
                 match message {
                     Ok(Some(job)) => {
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                            eprintln!("network2: callback worker job panicked");
+                        }
                     }
                     Ok(None) | Err(_) => break,
                 }
@@ -645,21 +647,24 @@ impl Connection {
                     continue;
                 }
                 if state.queued_bytes.saturating_add(payload_len + 64) > 128 * 1024 * 1024 {
-                    // Receive-side lease failure drops this frame silently.
-                    offset += frame_size;
-                    consumed = offset;
-                    frames += 1;
-                    continue;
+                    eprintln!(
+                        "network2: closing connection {}: receive queue memory limit exceeded (queued={} incoming={})",
+                        self.id, state.queued_bytes, payload_len + 64
+                    );
+                    should_close = true;
+                    break;
                 }
                 let Some(lease) = MemoryLease::acquire(
                     &self.global_memory,
                     payload_len + 64,
                     self.global_limit,
                 ) else {
-                    offset += frame_size;
-                    consumed = offset;
-                    frames += 1;
-                    continue;
+                    eprintln!(
+                        "network2: closing connection {}: global receive memory budget exhausted (incoming={})",
+                        self.id, payload_len + 64
+                    );
+                    should_close = true;
+                    break;
                 };
                 let payload_start = header_start + header_len;
                 let payload = state.input[payload_start..payload_start + payload_len].to_vec();
@@ -684,6 +689,10 @@ impl Connection {
                             }
                         }
                         Err(TransportError::EidLimit) => {
+                            eprintln!(
+                                "network2: closing connection {}: active EID limit reached (limit={})",
+                                self.id, MAX_ACTIVE_EIDS_PER_CONNECTION
+                            );
                             should_close = true;
                             break;
                         }
@@ -1370,7 +1379,8 @@ fn make_server_connection(inner: &Arc<ServerInner>, stream: TcpStream, peer_ip: 
             if valid {
                 let callback = Arc::clone(&inner.handshake_callback);
                 let weak_again = Arc::downgrade(&inner);
-                let _ = inner.handshake_pool.submit(Box::new(move || {
+                let temp_for_log = temp.clone();
+                if let Err(error) = inner.handshake_pool.submit(Box::new(move || {
                     if let Some(inner) = weak_again.upgrade() {
                         let still_valid = inner
                             .temporary
@@ -1382,7 +1392,21 @@ fn make_server_connection(inner: &Arc<ServerInner>, stream: TcpStream, peer_ip: 
                             callback(temp);
                         }
                     }
-                }));
+                })) {
+                    eprintln!(
+                        "network2: failed to schedule handshake callback for connection {} (temporary client id {}): {}",
+                        handshake_connection_id, hex::encode(&temp_for_log), error
+                    );
+                    let conn = inner
+                        .temporary
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&temp_for_log)
+                        .cloned();
+                    if let Some(conn) = conn {
+                        conn.close();
+                    }
+                }
             }
         }
     });
@@ -1399,7 +1423,8 @@ fn make_server_connection(inner: &Arc<ServerInner>, stream: TcpStream, peer_ip: 
             if valid {
                 let callback = Arc::clone(&inner.exchange_callback);
                 let weak_again = Arc::downgrade(&inner);
-                let _ = inner.exchange_pool.submit(Box::new(move || {
+                let client_id_for_log = hex::encode(&cid);
+                if let Err(error) = inner.exchange_pool.submit(Box::new(move || {
                     if let Some(inner) = weak_again.upgrade() {
                         let still_valid = inner
                             .connections
@@ -1409,9 +1434,33 @@ fn make_server_connection(inner: &Arc<ServerInner>, stream: TcpStream, peer_ip: 
                             .is_some_and(|conn| conn.is_eid_active(eid));
                         if still_valid {
                             callback(cid, eid);
+                        } else {
+                            eprintln!(
+                                "network2: skipped exchange callback because connection {} or EID {} is no longer active",
+                                exchange_connection_id, hex::encode(eid)
+                            );
                         }
                     }
-                }));
+                })) {
+                    eprintln!(
+                        "network2: failed to schedule exchange callback for connection {} (client_id {}, EID {}): {}",
+                        exchange_connection_id, client_id_for_log, hex::encode(eid), error
+                    );
+                    let conn = inner
+                        .connections
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&exchange_connection_id)
+                        .cloned();
+                    if let Some(conn) = conn {
+                        conn.close();
+                    }
+                }
+            } else {
+                eprintln!(
+                    "network2: ignored exchange event for inactive connection {} (EID {})",
+                    exchange_connection_id, hex::encode(eid)
+                );
             }
         }
     });
@@ -1436,9 +1485,16 @@ fn make_server_connection(inner: &Arc<ServerInner>, stream: TcpStream, peer_ip: 
             decrement_peer(&inner, peer_ip);
             if let Some(cid) = cid {
                 let callback = Arc::clone(&inner.disconnect_callback);
-                let _ = inner
+                let client_id_for_log = hex::encode(&cid);
+                if let Err(error) = inner
                     .disconnect_pool
-                    .submit(Box::new(move || callback(cid, connection_id)));
+                    .submit(Box::new(move || callback(cid, connection_id)))
+                {
+                    eprintln!(
+                        "network2: failed to schedule disconnect callback for connection {} (client_id {}): {}",
+                        connection_id, client_id_for_log, error
+                    );
+                }
             }
         }
     });
