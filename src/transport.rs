@@ -24,7 +24,6 @@ pub const MAX_UNAUTH_PAYLOAD: usize = 65_535;
 pub const MAX_AUTH_PAYLOAD: usize = 1 << 25;
 pub const QUEUE_LIMIT: usize = 16;
 pub const MAX_INPUT_BUFFER: usize = 32 * 1024 * 1024;
-pub const MAX_ACTIVE_EIDS_PER_CONNECTION: usize = 2048;
 pub const EID_TTL: Duration = Duration::from_secs(60);
 pub const UNAUTH_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_CID_BYTES: usize = 256;
@@ -374,9 +373,6 @@ impl Connection {
             *last = now;
             return Ok(false);
         }
-        if state.eid_activity.len() >= MAX_ACTIVE_EIDS_PER_CONNECTION {
-            return Err(TransportError::EidLimit);
-        }
         state.eid_activity.insert(eid, now);
         Ok(true)
     }
@@ -441,7 +437,7 @@ impl Connection {
                 TransportError::AlreadyAuthenticated
             });
         }
-        if state.send.len() + usize::from(state.current_send.is_some()) >= QUEUE_LIMIT {
+        if state.send.len() + if state.current_send.is_some() { 1 } else { 0 } >= QUEUE_LIMIT {
             return Err(TransportError::SendQueueFull);
         }
         let eid = if authenticated {
