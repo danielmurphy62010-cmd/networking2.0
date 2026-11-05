@@ -437,7 +437,7 @@ impl Connection {
                 TransportError::AlreadyAuthenticated
             });
         }
-        if state.send.len() + if state.current_send.is_some() { 1 } else { 0 } >= QUEUE_LIMIT {
+        if state.send.len() + (state.current_send.is_some() as usize) >= QUEUE_LIMIT {
             return Err(TransportError::SendQueueFull);
         }
         let eid = if authenticated {
