@@ -24,6 +24,7 @@ pub const MAX_UNAUTH_PAYLOAD: usize = 65_535;
 pub const MAX_AUTH_PAYLOAD: usize = 1 << 25;
 pub const QUEUE_LIMIT: usize = 16;
 pub const MAX_INPUT_BUFFER: usize = 32 * 1024 * 1024;
+pub const MAX_ACTIVE_EIDS_PER_CONNECTION: usize = 2048;
 pub const EID_TTL: Duration = Duration::from_secs(60);
 pub const UNAUTH_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_CID_BYTES: usize = 256;
@@ -52,6 +53,8 @@ pub enum TransportError {
     InvalidEid,
     #[error("invalid client id: it must contain 1 to 256 bytes")]
     InvalidCid,
+    #[error("exchange-id limit reached")]
+    EidLimit,
     #[error("send queue is full")]
     SendQueueFull,
     #[error("payload exceeds the maximum for this protocol phase")]
@@ -348,14 +351,17 @@ impl Connection {
         }
     }
 
-    fn touch_eid(state: &mut ConnState, eid: [u8; 8], now: Instant) -> bool {
+    fn touch_eid(state: &mut ConnState, eid: [u8; 8], now: Instant) -> TResult<bool> {
         Self::expire_eids(state, now);
         if let Some(last) = state.eid_activity.get_mut(&eid) {
             *last = now;
-            return false;
+            return Ok(false);
+        }
+        if state.eid_activity.len() >= MAX_ACTIVE_EIDS_PER_CONNECTION {
+            return Err(TransportError::EidLimit);
         }
         state.eid_activity.insert(eid, now);
-        true
+        Ok(true)
     }
 
     fn expire_eids(state: &mut ConnState, now: Instant) {
@@ -425,16 +431,19 @@ impl Connection {
             let chosen = match eid {
                 Some(value) => value,
                 None => {
-                    loop {
+                    let mut chosen = None;
+                    for _ in 0..16 {
                         let bytes = random_bytes(8).map_err(|e| TransportError::Io(e.to_string()))?;
                         let candidate: [u8; 8] = bytes.try_into().expect("8 random bytes");
                         if !state.eid_activity.contains_key(&candidate) {
-                            break candidate;
+                            chosen = Some(candidate);
+                            break;
                         }
                     }
+                    chosen.ok_or(TransportError::EidLimit)?
                 }
             };
-            Self::touch_eid(&mut state, chosen, now);
+            Self::touch_eid(&mut state, chosen, now)?;
             Some(chosen)
         } else {
             None
@@ -660,21 +669,38 @@ impl Connection {
                 let payload_start = header_start + header_len;
                 let payload = state.input[payload_start..payload_start + payload_len].to_vec();
                 if let Some(exchange) = eid {
-                    let fresh = Self::touch_eid(&mut state, exchange, Instant::now());
-                    state.queued_bytes += payload_len + 64;
-                    state.receive.push_back(Message {
-                        authenticated: true,
-                        eid: Some(exchange),
-                        payload,
-                        _lease: lease,
-                    });
-                    if fresh {
-                        if self.is_server_side {
-                            if let Some(cid) = state.cid.clone() {
-                                server_events.push((cid, exchange));
+                    match Self::touch_eid(&mut state, exchange, Instant::now()) {
+                        Ok(fresh) => {
+                            state.queued_bytes += payload_len + 64;
+                            state.receive.push_back(Message {
+                                authenticated: true,
+                                eid: Some(exchange),
+                                payload,
+                                _lease: lease,
+                            });
+                            if fresh {
+                                if self.is_server_side {
+                                    if let Some(cid) = state.cid.clone() {
+                                        server_events.push((cid, exchange));
+                                    }
+                                } else {
+                                    client_events.push(exchange);
+                                }
                             }
-                        } else {
-                            client_events.push(exchange);
+                        }
+                        Err(TransportError::EidLimit) => {
+                            eprintln!(
+                                "network2: closing connection {}: active EID limit reached (limit={})",
+                                self.id, MAX_ACTIVE_EIDS_PER_CONNECTION
+                            );
+                            should_close = true;
+                            break;
+                        }
+                        Err(_) => {
+                            offset += frame_size;
+                            consumed = offset;
+                            frames += 1;
+                            continue;
                         }
                     }
                 } else {
