@@ -3,6 +3,13 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+
+# Keep only the newest build for a given branch; stale runs waste runners and
+# contend for the same Cargo/Conda caches.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 jobs:
