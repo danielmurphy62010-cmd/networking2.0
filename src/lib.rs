@@ -94,17 +94,22 @@ impl PyTCPServer {
     #[pyo3(signature = (payload, eid=None, client_id=None))]
     fn send(
         &self,
+        py: Python<'_>,
         payload: &[u8],
         eid: Option<&[u8]>,
         client_id: Option<&[u8]>,
     ) -> PyResult<Py<PyBytes>> {
-        let client_id = client_id.ok_or_else(|| PyValueError::new_err("client_id is required"))?;
+        let client_id = client_id
+            .ok_or_else(|| PyValueError::new_err("client_id is required"))?
+            .to_vec();
         if eid.is_some_and(|value| value.len() != 8) {
             return Err(PyValueError::new_err("eid must be exactly 8 bytes"));
         }
-        let result = self
-            .inner
-            .send(payload, eid, client_id)
+        let inner = self.inner.clone();
+        let payload = payload.to_vec();
+        let exchange = eid.map(|value| value.to_vec());
+        let result = py
+            .detach(move || inner.send(&payload, exchange.as_deref(), &client_id))
             .map_err(protocol_error)?;
         Python::attach(|py| Ok(PyBytes::new(py, &result).unbind()))
     }
