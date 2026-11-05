@@ -8,6 +8,7 @@ Supported language/target combinations:
   * cpp + python_extension  (setuptools + pybind11)
   * c/cpp + executable | shared_library | static_library
   * rust + executable      (Cargo)
+  * rust + python_extension (Cargo + PyO3)
   * go + executable         (go build)
   * python + executable     (PyInstaller or Nuitka)
 
@@ -29,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 import traceback
 from collections import OrderedDict
 from pathlib import Path, PurePosixPath
@@ -164,14 +166,14 @@ def normalized_target(language: str, config: dict[str, Any]) -> str:
     allowed = {
         "c": {"executable", "shared_library", "static_library"},
         "cpp": {"executable", "shared_library", "static_library", "python_extension"},
-        "rust": {"executable"},
+        "rust": {"executable", "python_extension"},
         "go": {"executable"},
         "python": {"executable"},
     }
     if target not in allowed[language]:
         raise BuildError(f"Unsupported target {target!r} for language {language!r}; expected one of {sorted(allowed[language])}")
-    if target == "python_extension" and language != "cpp":
-        raise BuildError("python_extension is currently supported for cpp/pybind11 modules only")
+    if target == "python_extension" and language not in {"cpp", "rust"}:
+        raise BuildError("python_extension is supported for cpp/pybind11 and rust/PyO3 modules")
     return target
 
 
@@ -179,36 +181,101 @@ def python_settings(module_key: str, config: dict[str, Any]) -> dict[str, Any]:
     value = config.get("python", {})
     result = require_dict(value, f"{module_key}.python")
     versions = result.get("versions", ["3.12"])
-    if isinstance(versions, str):
+    if isinstance(versions, (str, int, float)):
         versions = [versions]
     if not isinstance(versions, list) or not versions or any(not isinstance(v, (str, int, float)) for v in versions):
         raise BuildError(f"{module_key}.python.versions must be a non-empty string/number array")
-    normalized_versions = [str(v) for v in versions]
-    version_requests_free_threaded = any(value.lower().endswith("t") for value in normalized_versions)
-    normalized_versions = [value[:-1] if value.lower().endswith("t") else value for value in normalized_versions]
-    if len(set(normalized_versions)) != len(normalized_versions):
-        raise BuildError(f"{module_key}.python.versions must not contain duplicates")
-    abi = result.get("abi", "gil")
-    if result.get("free_threaded") is True or version_requests_free_threaded:
-        abi = "free-threaded"
-    if abi not in {"gil", "free-threaded"}:
-        raise BuildError(f"{module_key}.python.abi must be 'gil' or 'free-threaded'")
-    if abi == "free-threaded":
-        for version in normalized_versions:
-            match = re.match(r"^(\d+)\.(\d+)", version)
-            if match and tuple(map(int, match.groups())) < (3, 13):
-                raise BuildError(f"Free-threaded CPython requires Python 3.13 or newer; got {version}")
+
+    version_specs: list[dict[str, str | None]] = []
+    seen_version_specs: set[tuple[str, bool]] = set()
+    for raw_version in versions:
+        version_text = str(raw_version).strip()
+        explicit_free_threaded = version_text.lower().endswith("t")
+        version = version_text[:-1] if explicit_free_threaded else version_text
+        if not version:
+            raise BuildError(f"{module_key}.python.versions contains an empty version")
+        key = (version, explicit_free_threaded)
+        if key in seen_version_specs:
+            raise BuildError(f"{module_key}.python.versions contains a duplicate entry: {version_text!r}")
+        seen_version_specs.add(key)
+        version_specs.append({
+            "version": version,
+            "explicit_abi": "free-threaded" if explicit_free_threaded else None,
+        })
+
     result = dict(result)
     options = require_dict(result.get("options", {}), f"{module_key}.python.options")
     # Accept the nested options form from the documented example as well as
     # direct keys, with direct keys taking precedence.
     for option_key, option_value in options.items():
         result.setdefault(option_key, option_value)
-    result["versions"] = normalized_versions
-    result["abi"] = abi
+
+    raw_abis = result.get("abis", result.get("abi", "gil"))
+    if result.get("free_threaded") is True:
+        raw_abis = "free-threaded"
+    if isinstance(raw_abis, str):
+        raw_abis = [raw_abis]
+    if not isinstance(raw_abis, list) or not raw_abis or any(not isinstance(item, str) for item in raw_abis):
+        raise BuildError(f"{module_key}.python.abi/abis must be a string or a non-empty array of strings")
+
+    aliases = {
+        "gil": "gil",
+        "standard": "gil",
+        "gil-enabled": "gil",
+        "free-threaded": "free-threaded",
+        "free_threaded": "free-threaded",
+        "nogil": "free-threaded",
+        "t": "free-threaded",
+        "both": "both",
+    }
+    abis: list[str] = []
+    for raw_abi in raw_abis:
+        normalized = aliases.get(raw_abi.strip().lower())
+        if normalized is None:
+            raise BuildError(f"{module_key}.python.abi contains an unsupported value: {raw_abi!r}")
+        values = ["gil", "free-threaded"] if normalized == "both" else [normalized]
+        for abi in values:
+            if abi not in abis:
+                abis.append(abi)
+
+    result["versions"] = list(dict.fromkeys(spec["version"] for spec in version_specs))
+    result["version_specs"] = version_specs
+    result["abis"] = abis
+    # Keep the legacy single-ABI field readable for configs/tools that inspect it.
+    result["abi"] = abis[0] if len(abis) == 1 else list(abis)
     result["conda_dependencies"] = string_list(result.get("conda_dependencies"), f"{module_key}.python.conda_dependencies")
     result["pip_dependencies"] = string_list(result.get("pip_dependencies"), f"{module_key}.python.pip_dependencies")
     return result
+
+
+def python_variants(module_key: str, py: dict[str, Any]) -> list[tuple[str, str]]:
+    """Expand versions and ABIs into valid interpreter build variants."""
+    variants: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for version_spec in py["version_specs"]:
+        version = version_spec["version"]
+        requested_abis = [version_spec["explicit_abi"]] if version_spec["explicit_abi"] else py["abis"]
+        for abi in requested_abis:
+            if abi == "free-threaded" and version != "stable":
+                match = re.match(r"^(\d+)\.(\d+)", version)
+                if match and tuple(map(int, match.groups())) < (3, 13):
+                    if version_spec["explicit_abi"]:
+                        raise BuildError(f"Free-threaded CPython requires Python 3.13 or newer; got {version}")
+                    log(f"SKIP {module_key}: Python {version} has no free-threaded ABI")
+                    continue
+            pair = (version, abi)
+            if pair not in seen:
+                variants.append(pair)
+                seen.add(pair)
+    if not variants:
+        raise BuildError(f"{module_key}.python does not contain any supported version/ABI combinations")
+    return variants
+
+
+def python_conda_specs(version: str, abi: str) -> list[str]:
+    """Select an explicit conda-forge Python flavour and minor version."""
+    package = "python-freethreading" if abi == "free-threaded" else "python-gil"
+    return [package if version == "stable" else f"{package}={version}"]
 
 
 def env_fingerprint(specs: list[str], pip_specs: list[str], channels: list[str], platform_name: str) -> str:
@@ -306,12 +373,8 @@ def plan_tasks(
         if language == "cpp" and target == "python_extension":
             py = python_settings(module_key, config)
             sources = existing_sources(module_key, config.get("sources"))
-            for version in py["versions"]:
-                specs = ["pip", "setuptools", "wheel"]
-                if version != "stable":
-                    specs.append(f"python={version}")
-                if py["abi"] == "free-threaded":
-                    specs.append("python-freethreading")
+            for version, abi in python_variants(module_key, py):
+                specs = ["pip", "setuptools", "wheel", *python_conda_specs(version, abi)]
                 specs.extend(py["conda_dependencies"])
                 pip_specs = list(py["pip_dependencies"])
                 if not any(item.lower().split("[", 1)[0].split("=", 1)[0].split(">", 1)[0] == "pybind11" for item in pip_specs):
@@ -320,7 +383,7 @@ def plan_tasks(
                 env = make_env_definition(specs, pip_specs, channels, platform_name)
                 envs[env["fingerprint"]] = env
                 version_label = "stable" if version == "stable" else version.replace(".", "")
-                suffix = "t" if py["abi"] == "free-threaded" else ""
+                suffix = "t" if abi == "free-threaded" else ""
                 label = f"python-{version_label}{suffix}"
                 task_config = dict(config)
                 task_config["_resolved_sources"] = sources
@@ -328,7 +391,7 @@ def plan_tasks(
                     tasks, module_key=module_key, config=task_config, language=language,
                     target=target, label=label, platform_name=platform_name,
                     output_root=output_root, temp_root=temp_root, env=env,
-                    python_version=version, abi=py["abi"],
+                    python_version=version, abi=abi,
                 )
             continue
 
@@ -337,20 +400,39 @@ def plan_tasks(
             manifest = resolve_path(require_string(rust.get("manifest", "Cargo.toml"), f"{module_key}.rust.manifest"), f"{module_key}.rust.manifest")
             if not manifest.is_file():
                 raise BuildError(f"Rust manifest does not exist for {module_key!r}: {manifest}")
-            version = rust.get("version", "stable")
-            specs = ["rust" if version == "stable" else f"rust={version}"]
-            specs.extend(string_list(rust.get("conda_dependencies"), f"{module_key}.rust.conda_dependencies"))
-            pip_specs: list[str] = []
-            env = make_env_definition(specs, pip_specs, channels, platform_name)
-            envs[env["fingerprint"]] = env
+            rust_version = rust.get("version", "stable")
+            rust_specs = ["rust" if rust_version == "stable" else f"rust={rust_version}"]
+            rust_specs.extend(string_list(rust.get("conda_dependencies"), f"{module_key}.rust.conda_dependencies"))
             task_config = dict(config)
             task_config["_resolved_manifest"] = str(manifest)
             task_config["rust"] = rust
-            add_task(
-                tasks, module_key=module_key, config=task_config, language=language,
-                target=target, label="native", platform_name=platform_name,
-                output_root=output_root, temp_root=temp_root, env=env,
-            )
+
+            if target == "python_extension":
+                py = python_settings(module_key, config)
+                for python_version, abi in python_variants(module_key, py):
+                    specs = ["pip", *python_conda_specs(python_version, abi), *rust_specs]
+                    specs.extend(py["conda_dependencies"])
+                    pip_specs = list(py["pip_dependencies"])
+                    pip_specs.extend(base_pip)
+                    env = make_env_definition(specs, pip_specs, channels, platform_name)
+                    envs[env["fingerprint"]] = env
+                    version_label = "stable" if python_version == "stable" else python_version.replace(".", "")
+                    suffix = "t" if abi == "free-threaded" else ""
+                    label = f"python-{version_label}{suffix}"
+                    add_task(
+                        tasks, module_key=module_key, config=task_config, language=language,
+                        target=target, label=label, platform_name=platform_name,
+                        output_root=output_root, temp_root=temp_root, env=env,
+                        python_version=python_version, abi=abi,
+                    )
+            else:
+                env = make_env_definition(rust_specs, [], channels, platform_name)
+                envs[env["fingerprint"]] = env
+                add_task(
+                    tasks, module_key=module_key, config=task_config, language=language,
+                    target=target, label="native", platform_name=platform_name,
+                    output_root=output_root, temp_root=temp_root, env=env,
+                )
             continue
 
         if language == "go":
@@ -381,17 +463,13 @@ def plan_tasks(
             pip_specs = list(py["pip_dependencies"])
             pip_specs.extend(base_pip)
             pip_specs.append(packager if not packager_spec else f"{packager}=={packager_spec}")
-            for version in py["versions"]:
-                specs = ["pip"]
-                if version != "stable":
-                    specs.append(f"python={version}")
-                if py["abi"] == "free-threaded":
-                    specs.append("python-freethreading")
+            for version, abi in python_variants(module_key, py):
+                specs = ["pip", *python_conda_specs(version, abi)]
                 specs.extend(py["conda_dependencies"])
                 env = make_env_definition(specs, pip_specs, channels, platform_name)
                 envs[env["fingerprint"]] = env
                 version_label = "stable" if version == "stable" else version.replace(".", "")
-                suffix = "t" if py["abi"] == "free-threaded" else ""
+                suffix = "t" if abi == "free-threaded" else ""
                 label = f"python-{version_label}{suffix}"
                 task_config = dict(config)
                 task_config["python"] = dict(py)
@@ -400,7 +478,7 @@ def plan_tasks(
                     tasks, module_key=module_key, config=task_config, language=language,
                     target=target, label=label, platform_name=platform_name,
                     output_root=output_root, temp_root=temp_root, env=env,
-                    python_version=version, abi=py["abi"],
+                    python_version=version, abi=abi,
                 )
             continue
 
@@ -423,6 +501,17 @@ def resolve_conda() -> str:
 def run_checked(command: list[str], *, cwd: str | Path | None = None, env: dict[str, str] | None = None) -> None:
     log("$ " + subprocess.list2cmdline(command))
     subprocess.run(command, cwd=cwd, env=env, check=True)
+
+
+def capture_checked(
+    command: list[str],
+    *,
+    cwd: str | Path | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
+    log("$ " + subprocess.list2cmdline(command))
+    result = subprocess.run(command, cwd=cwd, env=env, check=True, capture_output=True, text=True)
+    return result.stdout.strip()
 
 
 def prepare_environment(
@@ -776,7 +865,162 @@ def build_cpp_extension(task: dict[str, Any]) -> list[Path]:
     return check_artifact_pattern(task, output)
 
 
+def build_rust_extension(task: dict[str, Any]) -> list[Path]:
+    """Build a PyO3 cdylib against the exact Python interpreter for this task."""
+    config = task["config"]
+    module = task["module"]
+    rust = require_dict(config.get("rust", {}), f"{module}.rust")
+    py = require_dict(config.get("python", {}), f"{module}.python")
+    manifest_value = config.get("_resolved_manifest") or rust.get("manifest", "Cargo.toml")
+    manifest = resolve_path(require_string(manifest_value, f"{module}.rust.manifest"), f"{module}.rust.manifest")
+    if not manifest.is_file():
+        raise BuildError(f"Rust manifest does not exist: {manifest}")
+
+    try:
+        cargo_manifest = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise BuildError(f"Could not parse Cargo manifest {manifest}: {exc}") from exc
+
+    package = require_dict(cargo_manifest.get("package", {}), f"{module}.Cargo.toml.package")
+    lib_config = require_dict(cargo_manifest.get("lib", {}), f"{module}.Cargo.toml.lib")
+    package_name = require_string(package.get("name"), f"{module}.Cargo.toml.package.name")
+    lib_name = lib_config.get("name", package_name.replace("-", "_"))
+    require_string(lib_name, f"{module}.Cargo.toml.lib.name")
+    crate_types = lib_config.get("crate-type", ["lib"])
+    if not isinstance(crate_types, list) or any(not isinstance(item, str) for item in crate_types):
+        raise BuildError(f"{module}.Cargo.toml.lib.crate-type must be an array of strings")
+    if "cdylib" not in crate_types:
+        raise BuildError(
+            f"{module} is configured as a PyO3 extension, but Cargo.toml [lib].crate-type "
+            "does not include 'cdylib'. Set crate-type = [\"cdylib\"] (optionally also 'rlib')."
+        )
+
+    if rust.get("target_triple"):
+        raise BuildError(
+            "rust.target_triple is not supported for PyO3 extension builds: the target Python "
+            "ABI must match the interpreter running on this build runner."
+        )
+
+    module_name = py.get("module_name", rust.get("module_name", lib_name))
+    require_string(module_name, f"{module}.python.module_name")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", module_name):
+        raise BuildError(f"{module}.python.module_name must be a valid dotted Python module name")
+    module_basename = module_name.rsplit(".", 1)[-1]
+
+    output = Path(task["output_dir"])
+    work = Path(task["work_dir"])
+    if output.exists():
+        shutil.rmtree(output)
+    if work.exists():
+        shutil.rmtree(work)
+    output.mkdir(parents=True)
+    target_dir = work / "cargo-target"
+    target_dir.mkdir(parents=True)
+
+    env_prefix = Path(task["env_prefix"])
+    python_executable = env_prefix / ("python.exe" if task["platform"] == "windows" else "bin/python")
+    if not python_executable.is_file():
+        raise BuildError(f"Python interpreter for this matrix task was not found: {python_executable}")
+
+    probe = (
+        "import json,sys,sysconfig; "
+        "print(json.dumps({"
+        "'major':sys.version_info.major,'minor':sys.version_info.minor,"
+        "'gil_disabled':int(sysconfig.get_config_var('Py_GIL_DISABLED') or 0),"
+        "'ext_suffix':sysconfig.get_config_var('EXT_SUFFIX')"
+        "}))"
+    )
+    python_info = json.loads(capture_checked(conda_command(task, ["python", "-c", probe]), cwd=REPO_ROOT))
+    actual_version = f"{python_info['major']}.{python_info['minor']}"
+    expected_version = task.get("python_version")
+    if expected_version not in (None, "stable") and actual_version != expected_version:
+        raise BuildError(
+            f"Conda selected Python {actual_version}, but this task requires Python {expected_version}"
+        )
+    actual_abi = "free-threaded" if python_info["gil_disabled"] else "gil"
+    expected_abi = task.get("abi", "gil")
+    if actual_abi != expected_abi:
+        raise BuildError(
+            f"Conda selected the {actual_abi} ABI, but this task requires {expected_abi}"
+        )
+    extension_suffix = python_info.get("ext_suffix")
+    if not isinstance(extension_suffix, str) or not extension_suffix:
+        raise BuildError("The selected Python interpreter did not report a valid EXT_SUFFIX")
+
+    profile = rust.get("profile", "release")
+    require_string(profile, f"{module}.rust.profile")
+    command = ["cargo", "build", "--manifest-path", str(manifest), "--profile", profile, "--lib"]
+    lockfile_exists = (manifest.parent / "Cargo.lock").is_file()
+    locked = rust.get("locked", lockfile_exists)
+    if not isinstance(locked, bool):
+        raise BuildError("rust.locked must be true or false")
+    if locked:
+        command.append("--locked")
+    if rust.get("offline", False):
+        command.append("--offline")
+    if rust.get("no_default_features", False):
+        command.append("--no-default-features")
+    if rust.get("all_features", False):
+        command.append("--all-features")
+    features = string_list(rust.get("features"), "rust.features")
+    if features:
+        command.extend(["--features", ",".join(features)])
+
+    env = msvc_environment() if task["platform"] == "windows" else os.environ.copy()
+    env["CARGO_TARGET_DIR"] = str(target_dir)
+    env["PYO3_PYTHON"] = str(python_executable)
+    cargo_jobs = rust.get("jobs", task.get("jobs_per_build", 1))
+    if not isinstance(cargo_jobs, int) or cargo_jobs < 1:
+        raise BuildError("rust.jobs must be a positive integer")
+    env["CARGO_BUILD_JOBS"] = str(cargo_jobs)
+    run_checked(conda_command(task, command), cwd=REPO_ROOT, env=env)
+
+    artifact_base = target_dir / profile
+    library_file = f"{lib_name}.dll" if task["platform"] == "windows" else f"lib{lib_name}.so"
+    built_library = artifact_base / library_file
+    if not built_library.is_file():
+        produced = [path.name for path in artifact_base.iterdir() if path.is_file()] if artifact_base.exists() else []
+        raise BuildError(
+            f"Cargo did not produce the PyO3 cdylib {built_library}. "
+            f"Files present: {produced}. Check [lib].name and [lib].crate-type in Cargo.toml."
+        )
+
+    package_path = Path(*module_name.split(".")[:-1])
+    destination_dir = output / package_path
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    extension_path = destination_dir / (module_basename + extension_suffix)
+    shutil.copy2(built_library, extension_path)
+
+    smoke_test = config.get("smoke_test", True)
+    if not isinstance(smoke_test, bool):
+        raise BuildError(f"{module}.smoke_test must be true or false")
+    if smoke_test:
+        smoke_env = os.environ.copy()
+        smoke_env["PYTHONPATH"] = str(output) + (
+            os.pathsep + smoke_env["PYTHONPATH"] if smoke_env.get("PYTHONPATH") else ""
+        )
+        smoke_code = (
+            "import importlib,sys; "
+            "m=importlib.import_module(sys.argv[1]); "
+            "print('Imported Rust extension:',m.__name__); "
+            "check=getattr(sys,'_is_gil_enabled',None); "
+            "expected=sys.argv[2]; "
+            "assert expected != 'free-threaded' or (check is not None and not check()), "
+            "'The extension re-enabled the GIL; update PyO3/module free-threading support.'"
+        )
+        run_checked(
+            conda_command(task, ["python", "-c", smoke_code, module_name, expected_abi]),
+            cwd=output,
+            env=smoke_env,
+        )
+
+    return check_artifact_pattern(task, output)
+
+
 def build_rust(task: dict[str, Any]) -> list[Path]:
+    if task["target"] == "python_extension":
+        return build_rust_extension(task)
+
     config = task["config"]
     rust = require_dict(config.get("rust", {}), f"{task['module']}.rust")
     output = Path(task["output_dir"])
@@ -1014,7 +1258,7 @@ def execute_task(task: dict[str, Any]) -> dict[str, Any]:
     try:
         if task["language"] in {"c", "cpp"} and task["target"] != "python_extension":
             files = build_native_c_cpp(task)
-        elif task["target"] == "python_extension":
+        elif task["language"] == "cpp" and task["target"] == "python_extension":
             files = build_cpp_extension(task)
         elif task["language"] == "rust":
             files = build_rust(task)
