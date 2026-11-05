@@ -270,7 +270,7 @@ def main() -> None:
             size = row.get("size_bytes")
             size_label = "1 KiB" if row["test"] == "ping_latency" else (
                 f"{size / (1024 * 1024):g} MiB" if size else "")
-            metric = row.get("median_ms", row.get("mib_s", row.get("median_mib_s", 0)))
+            metric = row.get("median_ms", row.get("aggregate_mib_s", row.get("mean_client_median_mib_s", 0)))
             unit = "ms" if "latency" in row["test"] else "MiB/s"
             print(f"  {row['test']:38} {size_label:>8}  {metric:10.3f} {unit}", flush=True)
 
