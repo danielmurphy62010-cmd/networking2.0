@@ -1,0 +1,23 @@
+name: Generate Cargo lockfile
+
+on:
+  push:
+    branches:
+      - feature/shared-io-mainloops
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate lockfile
+        run: cargo generate-lockfile
+      - uses: actions/upload-artifact@v4
+        with:
+          name: generated-cargo-lock
+          path: Cargo.lock
+          retention-days: 1
