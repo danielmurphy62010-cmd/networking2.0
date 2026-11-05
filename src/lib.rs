@@ -1,7 +1,7 @@
 pub mod backend;
 pub mod Encryption;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::PyBytes;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -93,7 +93,7 @@ pub struct TCPServer {
     signing_keys: (Vec<u8>, Vec<u8>),
     enable_bootstrap: Arc<Mutex<bool>>,
     keys: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
-    counters: Arc<Mutex<HashMap<Vec<u8>, [u64; 2]>>>,
+    counters: Arc<Mutex<HashMap<Vec<u8>, [u64; 2]>>>>,
     admin: Arc<Mutex<HashMap<Vec<u8>, bool>>>,
     usernames: Arc<Mutex<HashMap<Vec<u8>, String>>>,
     pending_bootstrap_totp: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
@@ -117,7 +117,7 @@ impl TCPServer {
         fs::create_dir_all("./server keys").map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
         let salt_path = "./server keys/SERVER SALT";
         let at_rest_key = derive_at_rest_key(&password, salt_path)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.message))?;
+            .map_err(|e| PyErr::new::<ProtocolError, _>(e))?;
         let sig_key_path = "./server keys/SIGNING KEY";
         let admin_totp_path = "./server keys/ADMIN - TOTP".to_string();
         let bootstrap_totp_path = "./server keys/BOOTSTRAP - TOTP".to_string();
@@ -140,15 +140,15 @@ impl TCPServer {
         let signing_keys = if Path::new(sig_key_path).exists() {
             let encrypted = fs::read(sig_key_path).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             let prv = Encryption::decryptGCM(&encrypted, &at_rest_key, None)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+                .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
             let pub_k = Encryption::get_pub(&prv, false)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+                .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
             (prv, pub_k)
         } else {
             let keys = Encryption::gen_ed25519(true)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+                .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
             let encrypted = Encryption::encryptGCM(&keys.0, &at_rest_key, None)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+                .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
             fs::write(sig_key_path, encrypted).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             (keys.0, keys.1)
         };
@@ -157,7 +157,7 @@ impl TCPServer {
             rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut totp_bytes);
             let base32_secret = base64::encode(&totp_bytes);
             let encrypted_totp = Encryption::encryptGCM(&totp_bytes, &at_rest_key, None)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+                .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
             fs::write(&admin_totp_path, encrypted_totp).map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             println!("--- NEW TOTP SECRET (Base32): {} ---", base32_secret);
         }
@@ -180,6 +180,7 @@ impl TCPServer {
         let bootstrap_totp_clone = bootstrap_totp_path.clone();
         let server_ref_for_hs = Arc::new(Mutex::new(None));
         let server_ref_clone = Arc::clone(&server_ref_for_hs);
+        
         let handshake_worker: backend::HandshakeCallback = Arc::new(move |temp_cid: Vec<u8>| {
             let pub_key = signing_pub_clone.clone();
             let prv_key = signing_prv_clone.clone();
@@ -192,6 +193,7 @@ impl TCPServer {
             let admin_totp = admin_totp_clone.clone();
             let bootstrap_totp = bootstrap_totp_clone.clone();
             let s_ref = Arc::clone(&server_ref_clone);
+            
             Box::pin(async move {
                 let s_opt = s_ref.lock().unwrap().clone();
                 let s = match s_opt {
@@ -216,10 +218,9 @@ impl TCPServer {
                     };
                     let mut sc: u64 = 1;
                     let mut rc: u64 = 0;
-                    let mut ekey_defined = false;
-                    let mut current_ekey = vec![];
                     let s_clone = Arc::clone(&s);
                     let tc_clone = temp_cid.clone();
+                    
                     let send_enc = move |data: &[u8], ekey: &[u8], defined: bool| -> Result<(), backend::BackendError> {
                         let ctr = sc.to_be_bytes();
                         sc += 1;
@@ -231,12 +232,14 @@ impl TCPServer {
                         payload.extend_from_slice(&encrypted);
                         s_clone.send_handshake(&tc_clone, payload)
                     };
+                    
                     let s_clone2 = Arc::clone(&s);
                     let tc_clone2 = temp_cid.clone();
-                    let mut recv_enc = move |timeout: u64, ekey: &[u8], defined: bool| -> Result<Vec<u8>, ProtocolError> {
-                        let payload = tokio::task::block_in_place(|| {
-                            rt_block_on(s_clone2.recv_handshake(&tc_clone2, Some(Duration::from_secs(timeout))))
-                        }).map_err(|e| ProtocolError::new(e.to_string()))?.ok_or_else(|| ProtocolError::new("Timed out".into()))?;
+                    let mut recv_enc = async move |timeout: u64, ekey: &[u8], defined: bool| -> Result<Vec<u8>, ProtocolError> {
+                        let payload = s_clone2.recv_handshake(&tc_clone2, Some(Duration::from_secs(timeout)))
+                            .await
+                            .map_err(|e| ProtocolError::new(e.to_string()))?
+                            .ok_or_else(|| ProtocolError::new("Timed out".into()))?;
                         if payload.len() < 8 {
                             return Err(ProtocolError::new("Timed out".into()));
                         }
@@ -259,6 +262,7 @@ impl TCPServer {
                     sign_data.extend_from_slice(&tss_salt);
                     let signed_init = Encryption::ed25519_sign(&prv_key, &sign_data).unwrap();
                     let _ = s.send_handshake(&temp_cid, signed_init);
+                    
                     let admin_totp_bytes = fs::read(&admin_totp).ok().and_then(|d| Encryption::decryptGCM(&d, &ark, None).ok()).unwrap_or_default();
                     let base32_sec = base64::encode(&admin_totp_bytes);
                     let totp = TOTP::new(TotpAlgorithm::SHA1, 6, 1, 30, Secret::Encoded(base32_sec).to_bytes().unwrap()).unwrap();
@@ -266,18 +270,22 @@ impl TCPServer {
                     let mut kdf_input = code.as_bytes().to_vec();
                     kdf_input.extend_from_slice(&tss_salt);
                     kdf_input.extend_from_slice(&tss);
-                    let admin_ekey = Encryption::kdf(&code.as_bytes(), &kdf_input, 5).unwrap_or(tss);
+                    let admin_ekey = Encryption::kdf(code.as_bytes(), &kdf_input, 5).unwrap_or(tss);
+                    
                     let mut nonce1 = vec![0u8; 32];
                     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce1);
                     let _ = send_enc(&nonce1, &admin_ekey, true);
-                    let nonce2 = match recv_enc(5, &admin_ekey, true) {
+                    
+                    let nonce2 = match recv_enc(5, &admin_ekey, true).await {
                         Ok(n) => n,
                         Err(_) => return,
                     };
+                    
                     let mut nhash_input = nonce1.clone();
                     nhash_input.extend_from_slice(&nonce2);
                     let nhash = Encryption::basic_kdf(&nhash_input, b"", 64);
-                    let client_nhash = match recv_enc(5, &admin_ekey, true) {
+                    
+                    let client_nhash = match recv_enc(5, &admin_ekey, true).await {
                         Ok(h) => h,
                         Err(_) => return,
                     };
@@ -297,7 +305,7 @@ impl TCPServer {
                             let path = entry.path();
                             if let Ok(stored_data) = fs::read(&path) {
                                 if let Ok(stored_pub) = Encryption::ed25519_verify(&pub_key, &stored_data) {
-                                    if subtle::ConstantTimeEq::ct_eq(&stored_pub, &client_pub).into() {
+                                    if subtle::ConstantTimeEq::ct_eq(stored_pub.as_slice(), client_pub.as_slice()).into() {
                                         auth_file = path.to_string_lossy().into_owned();
                                         break;
                                     }
@@ -310,16 +318,17 @@ impl TCPServer {
                         let keys = Encryption::gen_x25519(true).unwrap();
                         let signed_ephem = Encryption::ed25519_sign(&prv_key, &keys.1).unwrap();
                         let _ = s.send_handshake(&temp_cid, signed_ephem);
+                        
                         let signed_client_ephemeral = match s.recv_handshake(&temp_cid, Some(Duration::from_secs(5))).await {
                             Ok(Some(p)) => p,
                             _ => return,
                         };
-                        let client_ephemeral_pub = match Encryption::ed25519_verify(&client_pub, &signed_client_ephemeral) {
+                        let client_ephemeral_pub = match Encryption::ed25519_verify(&client_pub, signed_client_ephemeral.as_slice()) {
                             Ok(p) => p,
                             Err(_) => return,
                         };
                         let ekey = Encryption::shared_secret(&keys.0, &client_ephemeral_pub).unwrap();
-                        let _hash = Encryption::basic_kdf(&client_pub, b"", 6);
+                        let _hash = Encryption::basic_kdf(client_pub.as_slice(), b"", 6);
                         keys_map.lock().unwrap().insert(_hash.clone(), ekey);
                         counters_map.lock().unwrap().insert(_hash.clone(), [1, 0]);
                         admin_map.lock().unwrap().insert(_hash.clone(), false);
@@ -341,22 +350,21 @@ impl TCPServer {
                         sign_data.extend_from_slice(&tss_salt);
                         let signed_init = Encryption::ed25519_sign(&prv_key, &sign_data).unwrap();
                         let _ = s.send_handshake(&temp_cid, signed_init);
+                        
                         let signed_client_ephemeral = match s.recv_handshake(&temp_cid, Some(Duration::from_secs(5))).await {
                             Ok(Some(p)) => p,
                             _ => return,
                         };
-                        let client_ephemeral_pub = match Encryption::ed25519_verify(&client_pub, &signed_client_ephemeral) {
+                        let client_ephemeral_pub = match Encryption::ed25519_verify(&client_pub, signed_client_ephemeral.as_slice()) {
                             Ok(p) => p,
                             Err(_) => return,
                         };
                         let tss = Encryption::shared_secret(&init_key.0, &client_ephemeral_pub).unwrap();
                         
-                        let bootstrap_totp_bytes = fs::read(&bootstrap_totp).ok().and_then(|d| Encryption::decryptGCM(&d, &ark, None).ok()).unwrap_or_default();
-                        let base32_sec = base64::encode(&bootstrap_totp_bytes);
-                        let _hash = Encryption::basic_kdf(&client_pub, b"", 6);
+                        let _hash = Encryption::basic_kdf(client_pub.as_slice(), b"", 6);
                         let fid = hex::encode(&rand::random::<[u8; 8]>());
                         let auth_path = format!("./auth keys/{}", fid);
-                        let signed_client = Encryption::ed25519_sign(&prv_key, &client_pub).unwrap();
+                        let signed_client = Encryption::ed25519_sign(&prv_key, client_pub.as_slice()).unwrap();
                         let _ = fs::write(&auth_path, signed_client);
                         keys_map.lock().unwrap().insert(_hash.clone(), tss);
                         counters_map.lock().unwrap().insert(_hash.clone(), [1, 0]);
@@ -376,6 +384,7 @@ impl TCPServer {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         let server_arc = Arc::new(server);
         *server_ref_for_hs.lock().unwrap() = Some(Arc::clone(&server_arc));
+        
         Ok(Self {
             rt,
             server: server_arc,
@@ -421,24 +430,28 @@ impl TCPServer {
         let ekey = keys.get(cid_bytes).ok_or_else(|| PyErr::new::<ProtocolError, _>(ProtocolError::new("Client is not authenticated".into())))?;
         
         let mut counters = self.counters.lock().unwrap();
-        let [sc, rc] = counters.get_mut(cid_bytes).ok_or_else(|| PyErr::new::<ProtocolError, _>(ProtocolError::new("Client is not authenticated".into())))?;
+        let [sc, _rc] = counters.get_mut(cid_bytes).ok_or_else(|| PyErr::new::<ProtocolError, _>(ProtocolError::new("Client is not authenticated".into())))?;
         let ctr_bytes = sc.to_be_bytes();
         *sc += 1;
         drop(counters);
         drop(keys);
+        
         let final_eid = match e_bytes {
             Some(e) => e,
             None => new_eid().map_err(|e| PyErr::new::<ProtocolError, _>(e))?,
         };
+        
         let mut enc_data = ctr_bytes.to_vec();
         let mut aad = final_eid.to_vec();
         aad.extend_from_slice(&ctr_bytes);
         aad.extend_from_slice(b"1");
+        
         let encrypted = Encryption::encryptGCM(payload.as_bytes(), ekey, Some(&aad))
             .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
         enc_data.extend_from_slice(&encrypted);
+        
         let sent_eid = self.server.send(enc_data, cid_bytes, Some(final_eid))
-            .map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))?;
+            .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
         Ok(PyBytes::new(py, &sent_eid).into())
     }
     #[pyo3(signature = (client_id, eid, timeout=MAX_TIMEOUT))]
@@ -450,13 +463,16 @@ impl TCPServer {
         }
         let mut target_eid = [0u8; EID_SIZE];
         target_eid.copy_from_slice(e_bytes);
+        
         let keys = self.keys.lock().unwrap();
         let ekey = keys.get(cid_bytes).ok_or_else(|| PyErr::new::<ProtocolError, _>(ProtocolError::new("Client is not authenticated".into())))?.clone();
         drop(keys);
+        
         let timeout_dur = std::time::Duration::from_secs(timeout.min(MAX_TIMEOUT));
         let raw_opt = self.rt.block_on(async {
             self.server.recv(cid_bytes, target_eid, Some(timeout_dur)).await
-        }).map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))?;
+        }).map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+        
         let raw = match raw_opt {
             Some(r) => r,
             None => return Ok(None),
@@ -469,10 +485,12 @@ impl TCPServer {
         let mut aad = target_eid.to_vec();
         aad.extend_from_slice(ctr_bytes);
         aad.extend_from_slice(b"0");
+        
         let decrypted = Encryption::decryptGCM(&raw[8..], &ekey, Some(&aad))
             .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+            
         let mut counters = self.counters.lock().unwrap();
-        let [sc, rc] = counters.get_mut(cid_bytes).ok_or_else(|| PyErr::new::<ProtocolError, _>(ProtocolError::new("Client is not authenticated".into())))?;
+        let [_sc, rc] = counters.get_mut(cid_bytes).ok_or_else(|| PyErr::new::<ProtocolError, _>(ProtocolError::new("Client is not authenticated".into())))?;
         if counter <= *rc {
             return Err(PyErr::new::<ProtocolError, _>(ProtocolError::new("Counter Error".into())));
         }
@@ -597,7 +615,7 @@ impl TCPClient {
             .ok_or_else(|| PyErr::new::<ProtocolError, _>(ProtocolError::new("Connection closed".into())))?;
         let sent_eid = client
             .send(wire_data, Some(e_bytes))
-            .map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))?;
+            .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
         Ok(PyBytes::new(py, &sent_eid).into())
     }
     #[pyo3(signature = (eid, timeout=MAX_TIMEOUT))]
@@ -621,7 +639,7 @@ impl TCPClient {
         let raw_opt = self
             .rt
             .block_on(async { client.recv(target_eid, Some(timeout_dur)).await })
-            .map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))?;
+            .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
         let raw = match raw_opt {
             Some(r) => r,
             None => return Ok(None),
@@ -649,7 +667,7 @@ impl TCPClient {
             .ok_or_else(|| PyErr::new::<ProtocolError, _>(ProtocolError::new("Connection closed".into())))?;
         client
             .set_backpressure(enabled)
-            .map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))
+            .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))
     }
     fn close(&mut self) {
         if let Some(client) = self.client.take() {
@@ -681,11 +699,11 @@ impl TCPClient {
             req_admin.extend_from_slice(&init_key.1);
             client
                 .send_handshake(req_admin)
-                .map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))?;
+                .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
             let server_cert = self
                 .rt
                 .block_on(async { client.recv_handshake(Some(Duration::from_secs(1))).await })
-                .map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))?
+                .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?
                 .ok_or_else(|| PyErr::new::<ProtocolError, _>(ProtocolError::new("Handshake timed out".into())))?;
             if !self.server_cert.is_empty() && self.server_cert != server_cert {
                 return Err(PyErr::new::<ProtocolError, _>(ProtocolError::new("Server certificate is invalid".into())));
@@ -694,7 +712,7 @@ impl TCPClient {
             let signed_resp = self
                 .rt
                 .block_on(async { client.recv_handshake(Some(Duration::from_secs(1))).await })
-                .map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))?
+                .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?
                 .ok_or_else(|| PyErr::new::<ProtocolError, _>(ProtocolError::new("Handshake timed out".into())))?;
             let response = Encryption::ed25519_verify(&server_cert, &signed_resp)
                 .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
@@ -768,72 +786,72 @@ impl TCPClient {
             }
             client
                 .send_handshake(pub_key.clone())
-                .map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))?;
+                .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
             let server_cert = self
                 .rt
                 .block_on(async { client.recv_handshake(Some(Duration::from_secs(1))).await })
-                .map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))?
+                .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?
                 .ok_or_else(|| PyErr::new::<ProtocolError, _>(ProtocolError::new("Handshake timed out".into())))?;
             if !self.server_cert.is_empty() && self.server_cert != server_cert {
                 return Err(PyErr::new::<ProtocolError, _>(ProtocolError::new("Server certificate is invalid".into())));
             }
             self.server_cert = server_cert.clone();
             let signed_cert = Encryption::ed25519_sign(&sig_prv, &server_cert)
-                .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+                .map_err(|e| ProtocolError::new(e.to_string()))?;
             let _ = fs::write("./client keys/server_cert", signed_cert);
             let status = self
                 .rt
                 .block_on(async { client.recv_handshake(Some(Duration::from_secs(5))).await })
-                .map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))?
+                .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?
                 .ok_or_else(|| PyErr::new::<ProtocolError, _>(ProtocolError::new("Auth Denied".into())))?;
             if status == b"ACK" {
                 let signed_resp = self
                     .rt
                     .block_on(async { client.recv_handshake(Some(Duration::from_secs(5))).await })
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))?
+                    .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?
                     .ok_or_else(|| PyErr::new::<ProtocolError, _>(ProtocolError::new("Handshake timed out".into())))?;
                 let server_ephemeral_pub = Encryption::ed25519_verify(&server_cert, &signed_resp)
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+                    .map_err(|e| ProtocolError::new(e.to_string()))?;
                 let keys = Encryption::gen_x25519(true)
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+                    .map_err(|e| ProtocolError::new(e.to_string()))?;
                 let signed_ephem = Encryption::ed25519_sign(&sig_prv, &keys.1)
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+                    .map_err(|e| ProtocolError::new(e.to_string()))?;
                 client
                     .send_handshake(signed_ephem)
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))?;
-                let shared_sec = Encryption::shared_secret(&keys.0, &server_ephemeral_pub)
                     .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+                let shared_sec = Encryption::shared_secret(&keys.0, &server_ephemeral_pub)
+                    .map_err(|e| ProtocolError::new(e.to_string()))?;
                 self.ekey = Some(shared_sec);
                 self.sc = 1;
                 self.rc = 0;
             } else if status == b"NACK" {
                 let totp_code = rpassword::prompt_password("Auth Key Security Code: ")
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+                    .map_err(|e| ProtocolError::new(e.to_string()))?;
                 let signed_resp = self
                     .rt
                     .block_on(async { client.recv_handshake(Some(Duration::from_secs(5))).await })
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))?
+                    .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?
                     .ok_or_else(|| PyErr::new::<ProtocolError, _>(ProtocolError::new("Handshake timed out".into())))?;
                 let response = Encryption::ed25519_verify(&server_cert, &signed_resp)
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+                    .map_err(|e| ProtocolError::new(e.to_string()))?;
                 if response.len() < 64 {
                     return Err(PyErr::new::<ProtocolError, _>(ProtocolError::new("Invalid response".into())));
                 }
                 let server_ephemeral_pub = &response[..response.len() - 64];
                 let tss_salt = &response[response.len() - 64..];
                 let keys = Encryption::gen_x25519(true)
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+                    .map_err(|e| ProtocolError::new(e.to_string()))?;
                 let signed_ephem = Encryption::ed25519_sign(&sig_prv, &keys.1)
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+                    .map_err(|e| ProtocolError::new(e.to_string()))?;
                 client
                     .send_handshake(signed_ephem)
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))?;
-                let tss_shared = Encryption::shared_secret(&keys.0, server_ephemeral_pub)
                     .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+                let tss_shared = Encryption::shared_secret(&keys.0, server_ephemeral_pub)
+                    .map_err(|e| ProtocolError::new(e.to_string()))?;
                 let mut kdf_input = tss_salt.to_vec();
                 kdf_input.extend_from_slice(&tss_shared);
                 let tss = Encryption::kdf(totp_code.as_bytes(), &kdf_input, 5)
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+                    .map_err(|e| ProtocolError::new(e.to_string()))?;
                 let mut sc = 1u64;
                 let mut rc = 0u64;
                 let send_enc = |payload: &[u8], sc_val: &mut u64| -> Result<(), ProtocolError> {
@@ -883,31 +901,31 @@ impl TCPClient {
                 let server_cert2 = self
                     .rt
                     .block_on(async { client.recv_handshake(Some(Duration::from_secs(5))).await })
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))?
+                    .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?
                     .ok_or_else(|| PyErr::new::<ProtocolError, _>(ProtocolError::new("Handshake timed out".into())))?;
                 let response2 = Encryption::ed25519_verify(&server_cert, &server_cert2)
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+                    .map_err(|e| ProtocolError::new(e.to_string()))?;
                 let keys2 = Encryption::gen_x25519(true)
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+                    .map_err(|e| ProtocolError::new(e.to_string()))?;
                 let signed_ephem2 = Encryption::ed25519_sign(&sig_prv, &keys2.1)
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+                    .map_err(|e| ProtocolError::new(e.to_string()))?;
                 client
                     .send_handshake(signed_ephem2)
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))?;
-                let shared_sec2 = Encryption::shared_secret(&keys2.0, &response2)
                     .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+                let shared_sec2 = Encryption::shared_secret(&keys2.0, &response2)
+                    .map_err(|e| ProtocolError::new(e.to_string()))?;
                 self.ekey = Some(shared_sec2);
                 self.sc = sc;
                 self.rc = rc;
                 let encrypted_prv = Encryption::encryptGCM(&sig_prv, &at_rest_key, None)
-                    .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
+                    .map_err(|e| ProtocolError::new(e.to_string()))?;
                 let _ = fs::write("./client keys/auth_key", encrypted_prv);
                 let _ = fs::write("./client keys/salt", &salt);
             } else {
                 return Err(PyErr::new::<ProtocolError, _>(ProtocolError::new("Auth Denied".into())));
             }
         }
-        client.auth_finished().map_err(|e| PyErr::new::<ProtocolError, _>(e.into()))?;
+        client.auth_finished().map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
         Ok(())
     }
 }
