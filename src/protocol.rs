@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Write},
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -1504,7 +1504,7 @@ impl ProtocolClient {
         let mut wire_payload = Vec::with_capacity(8 + encrypted.len());
         wire_payload.extend_from_slice(&counter_bytes);
         wire_payload.extend_from_slice(&encrypted);
-        self.transport()
+        self.transport()?
             .send(wire_payload, Some(exchange.to_vec()))?;
         Ok(exchange.to_vec())
     }
@@ -1517,7 +1517,7 @@ impl ProtocolClient {
 
     fn recv_internal(&self, eid: &[u8], timeout: Option<Duration>) -> PResult<Option<Vec<u8>>> {
         let exchange = exact_eid(eid)?;
-        let wire = self.transport().recv(&exchange, timeout)?;
+        let wire = self.transport()?.recv(&exchange, timeout)?;
         let Some(wire) = wire else { return Ok(None) };
         if wire.len() < 8 + crypto::AES_GCM_OVERHEAD {
             return Err(ProtocolFailure("encrypted message is too short".into()));

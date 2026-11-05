@@ -10,7 +10,7 @@ use std::{
     io::{self, Read, Write},
     net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{sync_channel, Receiver, SyncSender, TrySendError},
         Arc, Condvar, Mutex, Weak,
     },
@@ -1140,7 +1140,7 @@ impl TransportServer {
             .get(cid)
             .cloned()
             .ok_or(TransportError::UnknownClient)?;
-        let eid = eid.map(parse_eid).transpose()?;
+        let eid = eid.as_deref().map(parse_eid).transpose()?;
         Ok(conn.queue_send(payload, eid, true)?.to_vec())
     }
 
@@ -1583,7 +1583,7 @@ impl TransportClient {
     }
 
     pub fn send(&self, payload: Vec<u8>, eid: Option<Vec<u8>>) -> TResult<Vec<u8>> {
-        let eid = eid.map(parse_eid).transpose()?;
+        let eid = eid.as_deref().map(parse_eid).transpose()?;
         Ok(self.conn.queue_send(payload, eid, true)?.to_vec())
     }
 

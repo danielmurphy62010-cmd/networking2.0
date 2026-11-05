@@ -341,16 +341,13 @@ impl PyTCPClient {
         &self,
         py: Python<'_>,
         eid: &[u8],
-        timeout: &Bound<'_, PyAny>,
+        timeout: Option<f64>,
     ) -> PyResult<Option<Py<PyBytes>>> {
         if eid.len() != 8 {
             return Err(PyValueError::new_err("eid must be exactly 8 bytes"));
         }
-        let timeout = if timeout.is_none() {
-            None
-        } else {
-            timeout_from_seconds(Some(timeout.extract::<f64>()?), None)?
-        };
+        // Omitted timeout defaults to 10 seconds; explicit None means wait forever.
+        let timeout = timeout_from_seconds(timeout, None)?;
         let inner = self.inner.clone();
         let exchange = eid.to_vec();
         let result = py
