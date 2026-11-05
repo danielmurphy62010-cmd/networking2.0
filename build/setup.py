@@ -635,15 +635,15 @@ def msvc_environment() -> dict[str, str]:
             failures.append(f"{label}: vcvarsall.bat is missing")
             continue
 
-        # Keep this as a single cmd.exe command string. CALL is required for
-        # a .bat file so that SET runs after vcvarsall returns to this shell.
+        # CALL is required so SET runs after vcvarsall returns to this shell.
         command = f'call "{vcvars}" x64 && set'
-        # Pass the command string through COMSPEC. Passing cmd.exe /c as an
-        # argv list makes Python escape the embedded quotes on Windows, causing
-        # cmd.exe to treat the quotes around vcvarsall.bat as literal characters.
+        # Build cmd.exe's command line explicitly. /s removes the outer quote
+        # pair around the /c payload, preserving the inner quotes around the
+        # batch-file path (which may contain spaces). Passing the payload as an
+        # argv element or through shell=True causes nested-quote corruption.
+        command_line = f'"{comspec}" /d /s /c "{command}"'
         result = subprocess.run(
-            command,
-            shell=True,
+            command_line,
             capture_output=True, text=True, errors="replace",
         )
         if result.returncode != 0:
