@@ -567,7 +567,12 @@ def conda_command(task: dict[str, Any], command: list[str]) -> list[str]:
 
 
 def msvc_environment() -> dict[str, str]:
-    """Return a copy of the current environment initialized for MSVC x64."""
+    """Return a copy of the environment initialized for a usable MSVC x64 toolchain.
+
+    Hosted Windows images can contain more than one Visual Studio installation.
+    Do not assume the newest one is usable: try every installation that advertises
+    the x86/x64 C++ tools, newest first, and retain the diagnostics from failures.
+    """
     if os.name != "nt":
         return os.environ.copy()
 
@@ -577,31 +582,94 @@ def msvc_environment() -> dict[str, str]:
     ]
     vswhere = next((path for path in roots if path.is_file()), None)
     if vswhere is None:
-        raise BuildError("MSVC was requested, but vswhere.exe was not found. The Windows runner needs the Visual C++ build tools.")
+        raise BuildError(
+            "MSVC was requested, but vswhere.exe was not found. "
+            "The Windows runner needs the Visual C++ build tools."
+        )
 
-    result = subprocess.run(
-        [str(vswhere), "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"],
-        check=True, capture_output=True, text=True,
+    query = subprocess.run(
+        [
+            str(vswhere), "-all", "-products", "*",
+            "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-format", "json",
+        ],
+        capture_output=True, text=True, errors="replace",
     )
-    install = result.stdout.strip().splitlines()
-    if not install:
-        raise BuildError("Visual Studio C++ Build Tools were not found by vswhere.")
-    vcvars = Path(install[0]) / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
-    if not vcvars.is_file():
-        raise BuildError(f"MSVC vcvarsall.bat was not found: {vcvars}")
+    if query.returncode != 0:
+        raise BuildError(
+            "vswhere could not enumerate Visual Studio installations: "
+            + (query.stderr.strip() or query.stdout.strip() or f"exit code {query.returncode}")
+        )
+    try:
+        installations = json.loads(query.stdout)
+    except json.JSONDecodeError as exc:
+        raise BuildError(f"vswhere returned invalid JSON: {exc}") from exc
+    if not isinstance(installations, list):
+        raise BuildError("vswhere returned an unexpected installation list")
 
-    # Run vcvarsall in a child cmd process and import the resulting environment.
-    cmdline = f'call "{vcvars}" x64 >nul && set'
-    env_result = subprocess.run(
-        [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", cmdline],
-        check=True, capture_output=True, text=True, errors="replace",
+    def version_key(item: dict[str, Any]) -> tuple[int, ...]:
+        value = str(item.get("installationVersion", "0"))
+        try:
+            return tuple(int(part) for part in value.split("."))
+        except ValueError:
+            return (0,)
+
+    installations = sorted(
+        (item for item in installations if isinstance(item, dict) and item.get("installationPath")),
+        key=version_key,
+        reverse=True,
     )
-    env = os.environ.copy()
-    for line in env_result.stdout.splitlines():
-        key, separator, value = line.partition("=")
-        if separator and key:
-            env[key] = value
-    return env
+    if not installations:
+        raise BuildError(
+            "Visual Studio C++ Build Tools were not found by vswhere. "
+            "Install the 'Desktop development with C++' workload."
+        )
+
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    failures: list[str] = []
+    for installation in installations:
+        install_path = Path(str(installation["installationPath"]))
+        vcvars = install_path / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
+        label = f"{install_path} (version {installation.get('installationVersion', 'unknown')})"
+        if not vcvars.is_file():
+            failures.append(f"{label}: vcvarsall.bat is missing")
+            continue
+
+        # Keep this as a single cmd.exe command string. CALL is required for
+        # a .bat file so that SET runs after vcvarsall returns to this shell.
+        command = f'call "{vcvars}" x64 && set'
+        result = subprocess.run(
+            [comspec, "/d", "/c", command],
+            capture_output=True, text=True, errors="replace",
+        )
+        if result.returncode != 0:
+            detail = (result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}")
+            failures.append(f"{label}: vcvarsall exited {result.returncode}: {detail[-2500:]}")
+            continue
+
+        env = os.environ.copy()
+        for line in result.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            # cmd.exe can emit pseudo-variables such as '=C:'; those are not
+            # ordinary environment keys and cannot be imported with os.environ.
+            if separator and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_()]*", key):
+                env[key] = value
+
+        if shutil.which("cl.exe", path=env.get("PATH")) is None:
+            failures.append(f"{label}: vcvarsall succeeded but cl.exe is not on PATH")
+            continue
+        if not env.get("INCLUDE") or not env.get("LIB"):
+            failures.append(f"{label}: vcvarsall did not define INCLUDE and LIB")
+            continue
+        log(f"Using MSVC toolchain: {label}")
+        return env
+
+    detail = "\n".join(f"  - {failure}" for failure in failures)
+    raise BuildError(
+        "Could not initialize an MSVC x64 environment from any Visual Studio "
+        "installation. Ensure the Windows runner has the 'Desktop development "
+        "with C++' workload and a Windows SDK installed. Attempts:\n" + detail
+    )
 
 
 def copy_tree_contents(source: Path, destination: Path) -> list[Path]:
