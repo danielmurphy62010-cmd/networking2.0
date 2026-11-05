@@ -26,13 +26,13 @@
       "versions": [
         "3.12",
         "3.13",
-        "3.14"
+        "3.14",
+        "3.14t"
       ],
       "abi": [
-        "gil",
-        "free-threaded"
+        "gil"
       ],
-      "free_threaded_from": "3.13"
+      "free_threaded_from": "3.14"
     },
     "artifacts": {
       "windows_pattern": "*.pyd",
