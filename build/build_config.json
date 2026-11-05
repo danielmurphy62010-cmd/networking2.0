@@ -1,0 +1,42 @@
+
+{
+  "settings": {
+    "max_workers": 4,
+    "conda_channels": [
+      "conda-forge"
+    ],
+    "environment_directory": "build/environments",
+    "temporary_directory": "build/temp"
+  },
+  "network2": {
+    "language": "rust",
+    "target": "python_extension",
+    "platforms": [
+      "windows",
+      "linux"
+    ],
+    "rust": {
+      "manifest": "Cargo.toml",
+      "profile": "release",
+      "locked": true,
+      "features": [],
+      "jobs": 4
+    },
+    "python": {
+      "versions": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "abi": [
+        "gil",
+        "free-threaded"
+      ],
+      "free_threaded_from": "3.13"
+    },
+    "artifacts": {
+      "windows_pattern": "*.pyd",
+      "linux_pattern": "*.so"
+    }
+  }
+}

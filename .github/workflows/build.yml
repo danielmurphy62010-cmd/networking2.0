@@ -1,48 +1,44 @@
-name: Build Python Wheel
-
+name: Compile code
 on:
   push:
-    branches: [ "main", "master" ]
   pull_request:
-    branches: [ "main", "master" ]
   workflow_dispatch:
-
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  build-wheel:
-    name: Build Python Wheel (.whl)
-    runs-on: windows-latest
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
     steps:
-      - name: Check out repository
+      - name: Check out source
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v4
         with:
-          python-version: '3.14'
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install Maturin
-        run: pip install maturin
-
-      - name: Build Python Wheel
-        run: maturin build --release --out dist
-
-      - name: Upload Wheel Artifact
+          miniconda-version: latest
+          activate-environment: ""
+          auto-activate: false
+          auto-update-conda: false
+          conda-solver: libmamba
+          channels: conda-forge
+          channel-priority: strict
+      - name: Build configured modules
+        shell: bash
+        run: |
+          python build/setup.py build \
+            --config build/build_config.json \
+            --output "$RUNNER_TEMP/native-builds" \
+            --workers 4
+      - name: Upload build results
         uses: actions/upload-artifact@v4
         with:
-          name: network2-wheel
-          path: dist/*.whl
+          name: native-builds-${{ matrix.os }}
+          path: ${{ runner.temp }}/native-builds
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 1
