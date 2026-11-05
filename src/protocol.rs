@@ -30,9 +30,29 @@ const CLIENT_SALT_FILE: &str = "salt";
 const CLIENT_AUTH_FILE: &str = "auth_key";
 const CLIENT_SERVER_CERT_FILE: &str = "server_cert";
 const MAX_TIMEOUT: Duration = Duration::from_secs(10);
+// Preserve the protocol's original 1 s / 5 s defaults. The benchmark scripts
+// may opt into longer windows because the Argon2id handshake KDF is expensive.
 const HANDSHAKE_FIRST_TIMEOUT: Duration = Duration::from_secs(1);
 const HANDSHAKE_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+const EXCHANGE_CALLBACK_TIMEOUT: Duration = Duration::from_secs(1);
 const ADMIN_PREFIX: &[u8; 9] = b"REQ_ADMIN";
+
+fn configured_timeout(env_name: &str, fallback: Duration) -> Duration {
+    std::env::var(env_name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| (1..=300_000).contains(millis))
+        .map(Duration::from_millis)
+        .unwrap_or(fallback)
+}
+
+fn handshake_first_timeout() -> Duration {
+    configured_timeout("NETWORK2_HANDSHAKE_FIRST_TIMEOUT_MS", HANDSHAKE_FIRST_TIMEOUT)
+}
+
+fn handshake_default_timeout() -> Duration {
+    configured_timeout("NETWORK2_HANDSHAKE_DEFAULT_TIMEOUT_MS", HANDSHAKE_DEFAULT_TIMEOUT)
+}
 
 #[derive(Debug, Error)]
 #[error("{0}")]
@@ -255,7 +275,7 @@ impl ProtocolServer {
         let first = recv_handshake_required(
             &transport,
             temp_cid,
-            HANDSHAKE_FIRST_TIMEOUT,
+            handshake_first_timeout(),
             "initial client handshake frame",
         )?;
         transport.send_handshake(temp_cid, self.signing_public.clone())?;
@@ -321,7 +341,7 @@ impl ProtocolServer {
         let client_signed = recv_handshake_required(
             &transport,
             temp_cid,
-            HANDSHAKE_DEFAULT_TIMEOUT,
+            handshake_default_timeout(),
             "client signed ephemeral key",
         )?;
         let client_ephemeral_public = crypto::ed25519_verify(client_public, &client_signed)?;
@@ -381,7 +401,7 @@ impl ProtocolServer {
         let client_signed = recv_handshake_required(
             &transport,
             temp_cid,
-            HANDSHAKE_DEFAULT_TIMEOUT,
+            handshake_default_timeout(),
             "bootstrap client ephemeral key",
         )?;
         let client_data = crypto::ed25519_verify(client_public, &client_signed)?;
@@ -412,7 +432,7 @@ impl ProtocolServer {
             &tss,
             &mut channel.receive_counter,
             b'0',
-            HANDSHAKE_DEFAULT_TIMEOUT,
+            handshake_default_timeout(),
         )?;
         if nonce2.len() != 32 {
             return Err(ProtocolFailure("invalid bootstrap nonce length".into()));
@@ -426,7 +446,7 @@ impl ProtocolServer {
             &tss,
             &mut channel.receive_counter,
             b'0',
-            HANDSHAKE_FIRST_TIMEOUT,
+            handshake_first_timeout(),
         )?;
         if !ct_equal(&client_hash, &nhash) {
             return Err(ProtocolFailure("bootstrap nonce proof mismatch".into()));
@@ -449,7 +469,7 @@ impl ProtocolServer {
         let client_second_signed = recv_handshake_required(
             &transport,
             temp_cid,
-            HANDSHAKE_DEFAULT_TIMEOUT,
+            handshake_default_timeout(),
             "bootstrap second client ephemeral key",
         )?;
         let client_second_public = crypto::ed25519_verify(client_public, &client_second_signed)?;
@@ -522,7 +542,7 @@ impl ProtocolServer {
             &tss,
             &mut channel.receive_counter,
             b'0',
-            HANDSHAKE_DEFAULT_TIMEOUT,
+            handshake_default_timeout(),
         )?;
         if nonce2.len() != 32 {
             return Err(ProtocolFailure("invalid admin nonce length".into()));
@@ -536,7 +556,7 @@ impl ProtocolServer {
             &tss,
             &mut channel.receive_counter,
             b'0',
-            HANDSHAKE_FIRST_TIMEOUT,
+            handshake_first_timeout(),
         )?;
         if !ct_equal(&client_hash, &nhash) {
             return Err(ProtocolFailure("admin nonce proof mismatch".into()));
@@ -593,7 +613,7 @@ impl ProtocolServer {
     }
 
     fn dispatch_exchange(&self, cid: Vec<u8>, eid: [u8; 8]) {
-        let Ok(Some(data)) = self.recv_internal(&cid, &eid, Some(HANDSHAKE_FIRST_TIMEOUT)) else {
+        let Ok(Some(data)) = self.recv_internal(&cid, &eid, Some(EXCHANGE_CALLBACK_TIMEOUT)) else {
             return;
         };
         let Some(callback) = self.callback.as_ref() else {
@@ -1165,7 +1185,7 @@ impl ProtocolClient {
     }
 
     fn dispatch_exchange(&self, eid: [u8; 8]) {
-        let Ok(Some(data)) = self.recv_internal(&eid, Some(HANDSHAKE_FIRST_TIMEOUT)) else {
+        let Ok(Some(data)) = self.recv_internal(&eid, Some(EXCHANGE_CALLBACK_TIMEOUT)) else {
             return;
         };
         let Some(callback) = self.callback.as_ref() else { return };
@@ -1204,7 +1224,7 @@ impl ProtocolClient {
         transport.send_handshake(identity.signing_public.clone())?;
         let server_cert = recv_client_handshake_required(
             transport,
-            HANDSHAKE_FIRST_TIMEOUT,
+            handshake_first_timeout(),
             "server certificate",
         )?;
         crypto::parse_framed_key(
@@ -1227,13 +1247,13 @@ impl ProtocolClient {
 
         let status = recv_client_handshake_required(
             transport,
-            HANDSHAKE_DEFAULT_TIMEOUT,
+            handshake_default_timeout(),
             "server authentication status",
         )?;
         if status == b"ACK" {
             let signed_server_ephemeral = recv_client_handshake_required(
                 transport,
-                HANDSHAKE_DEFAULT_TIMEOUT,
+                handshake_default_timeout(),
                 "server signed ephemeral key",
             )?;
             let server_ephemeral =
@@ -1268,7 +1288,7 @@ impl ProtocolClient {
             .ok_or_else(|| ProtocolFailure("authentication denied".into()))?;
         let signed_init = recv_client_handshake_required(
             transport,
-            HANDSHAKE_DEFAULT_TIMEOUT,
+            handshake_default_timeout(),
             "bootstrap server ephemeral key",
         )?;
         let init_data = crypto::ed25519_verify(&server_cert, &signed_init)?;
@@ -1298,7 +1318,7 @@ impl ProtocolClient {
             &tss,
             &mut channel.receive_counter,
             b'1',
-            HANDSHAKE_FIRST_TIMEOUT,
+            handshake_first_timeout(),
         )?;
         if nonce1.len() != 32 {
             return Err(ProtocolFailure("invalid bootstrap server nonce length".into()));
@@ -1326,7 +1346,7 @@ impl ProtocolClient {
             &tss,
             &mut channel.receive_counter,
             b'1',
-            HANDSHAKE_FIRST_TIMEOUT,
+            handshake_first_timeout(),
         )?;
         let expected_proof = crypto::basic_kdf(&nhash, &[], 64);
         if !ct_equal(&server_proof, &expected_proof) {
@@ -1334,7 +1354,7 @@ impl ProtocolClient {
         }
         let signed_server_second = recv_client_handshake_required(
             transport,
-            HANDSHAKE_DEFAULT_TIMEOUT,
+            handshake_default_timeout(),
             "bootstrap second server ephemeral key",
         )?;
         let server_second_public =
@@ -1375,7 +1395,7 @@ impl ProtocolClient {
             .map_err(|_| ProtocolFailure("invalid server certificate hex".into()))?;
         let server_cert = recv_client_handshake_required(
             transport,
-            HANDSHAKE_FIRST_TIMEOUT,
+            handshake_first_timeout(),
             "server certificate",
         )?;
         if !ct_equal(&expected_cert, &server_cert) {
@@ -1388,7 +1408,7 @@ impl ProtocolClient {
         )?;
         let signed_init = recv_client_handshake_required(
             transport,
-            HANDSHAKE_FIRST_TIMEOUT,
+            handshake_first_timeout(),
             "admin server signed ephemeral key",
         )?;
         let init_data = crypto::ed25519_verify(&server_cert, &signed_init)?;
@@ -1406,7 +1426,7 @@ impl ProtocolClient {
             &tss,
             &mut channel.receive_counter,
             b'1',
-            HANDSHAKE_FIRST_TIMEOUT,
+            handshake_first_timeout(),
         )?;
         let nonce2 = crypto::random_bytes(32)?;
         hs_send_client(
@@ -1431,7 +1451,7 @@ impl ProtocolClient {
             &tss,
             &mut channel.receive_counter,
             b'1',
-            HANDSHAKE_FIRST_TIMEOUT,
+            handshake_first_timeout(),
         )?;
         if !ct_equal(&proof, &crypto::basic_kdf(&nhash, &[], 64)) {
             return Err(ProtocolFailure("admin server proof mismatch".into()));

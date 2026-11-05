@@ -724,6 +724,8 @@ impl Connection {
             } else if state.input.capacity() > 1024 * 1024
                 && state.input.len() < state.input.capacity() / 8
             {
+                // Store the target before the mutable method call to avoid
+                // overlapping immutable and mutable borrows of `state.input`.
                 let target_capacity = state.input.len().max(4096);
                 state.input.shrink_to(target_capacity);
             }
