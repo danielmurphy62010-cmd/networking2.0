@@ -19,6 +19,11 @@ pub struct ProtocolError {
     #[pyo3(get)]
     message: String,
 }
+impl From<ProtocolError> for PyErr {
+    fn from(err: ProtocolError) -> Self {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(err.message)
+    }
+}
 #[pymethods]
 impl ProtocolError {
     #[new]
@@ -515,7 +520,7 @@ impl TCPClient {
             rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt);
             let _ = fs::write(&salt_path, &salt);
         }
-        let at_rest_key = derive_at_rest_key(&password, &salt).unwrap_or_default();
+        let at_rest_key = derive_at_rest_key(&password, &salt_path).unwrap_or_default();
         let mut sig_prv = vec![];
         let mut pub_key = vec![];
         let mut server_cert = vec![];
