@@ -29,8 +29,10 @@ pub const EID_TTL: Duration = Duration::from_secs(60);
 pub const UNAUTH_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_CID_BYTES: usize = 256;
 const READ_CHUNK: usize = 16 * 1024;
-const READ_TICK: Duration = Duration::from_millis(20);
+const READ_BUDGET: usize = 256 * 1024;
 const WRITE_CHUNK: usize = 64 * 1024;
+const WRITE_BUDGET: usize = 256 * 1024;
+const MAINLOOP_IDLE_SLEEP: Duration = Duration::from_millis(1);
 const SERVER_CONNECTION_LIMIT: usize = 200;
 const SERVER_UNAUTH_LIMIT: usize = 128;
 const PER_PEER_CONNECTION_LIMIT: usize = 64;
@@ -177,6 +179,13 @@ struct Pending {
     _lease: MemoryLease,
 }
 
+struct InFlight {
+    frame: Vec<u8>,
+    offset: usize,
+    queued_bytes: usize,
+    _lease: MemoryLease,
+}
+
 struct MemoryLease {
     used: Arc<AtomicUsize>,
     bytes: usize,
@@ -211,6 +220,7 @@ struct ConnState {
     cid: Option<Vec<u8>>,
     receive: VecDeque<Message>,
     send: VecDeque<Pending>,
+    current_send: Option<InFlight>,
     input: Vec<u8>,
     eid_activity: HashMap<[u8; 8], Instant>,
     handshake_permits: usize,
@@ -231,6 +241,8 @@ struct Connection {
     magic2: [u8; 8],
     state: Mutex<ConnState>,
     changed: Condvar,
+    reader_stream: Mutex<TcpStream>,
+    writer_stream: Mutex<TcpStream>,
     shutdown_stream: TcpStream,
     global_memory: Arc<AtomicUsize>,
     global_limit: usize,
@@ -258,6 +270,9 @@ impl Connection {
         on_client_exchange: Option<ClientExchangeCallback>,
         on_close: Option<CloseCallback>,
     ) -> TResult<Arc<Self>> {
+        stream.set_nonblocking(true)?;
+        let reader_stream = stream.try_clone()?;
+        let writer_stream = stream.try_clone()?;
         let shutdown_stream = stream.try_clone()?;
         Ok(Arc::new(Self {
             id,
@@ -271,6 +286,7 @@ impl Connection {
                 cid: None,
                 receive: VecDeque::with_capacity(QUEUE_LIMIT),
                 send: VecDeque::with_capacity(QUEUE_LIMIT),
+                current_send: None,
                 input: Vec::with_capacity(4096),
                 eid_activity: HashMap::new(),
                 handshake_permits: 0,
@@ -279,6 +295,8 @@ impl Connection {
                 queued_bytes: 0,
             }),
             changed: Condvar::new(),
+            reader_stream: Mutex::new(reader_stream),
+            writer_stream: Mutex::new(writer_stream),
             shutdown_stream,
             global_memory,
             global_limit,
@@ -292,17 +310,17 @@ impl Connection {
         }))
     }
 
-    fn start(self: &Arc<Self>, mut reader: TcpStream, mut writer: TcpStream) {
+    // Client-side connections use the same step functions as the server's
+    // shared mainloops, but only need one RX and one TX worker of their own.
+    fn start(self: &Arc<Self>) {
         let read_conn = Arc::clone(self);
         let write_conn = Arc::clone(self);
-        let _ = reader.set_read_timeout(Some(READ_TICK));
-        let _ = writer.set_write_timeout(Some(READ_TICK));
-        thread::Builder::new()
+        let _ = thread::Builder::new()
             .name(format!("network2-rx-{}", self.id))
-            .spawn(move || read_conn.reader_loop(&mut reader));
-        thread::Builder::new()
+            .spawn(move || read_conn.reader_loop());
+        let _ = thread::Builder::new()
             .name(format!("network2-tx-{}", self.id))
-            .spawn(move || write_conn.writer_loop(&mut writer));
+            .spawn(move || write_conn.writer_loop());
     }
 
     fn is_closed(&self) -> bool {
@@ -330,6 +348,7 @@ impl Connection {
                 state.closed = true;
                 state.receive.clear();
                 state.send.clear();
+                state.current_send = None;
                 state.queued_bytes = 0;
                 self.changed.notify_all();
                 true
@@ -422,7 +441,7 @@ impl Connection {
                 TransportError::AlreadyAuthenticated
             });
         }
-        if state.send.len() >= QUEUE_LIMIT {
+        if state.send.len() + usize::from(state.current_send.is_some()) >= QUEUE_LIMIT {
             return Err(TransportError::SendQueueFull);
         }
         let eid = if authenticated {
@@ -754,35 +773,43 @@ impl Connection {
         }
     }
 
-    fn reader_loop(self: Arc<Self>, stream: &mut TcpStream) {
-        let mut buffer = [0u8; READ_CHUNK];
-        loop {
-            if self.is_closed() {
-                break;
-            }
-            {
-                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                if self.is_server_side
+    fn reader_step(&self) -> bool {
+        if self.is_closed() {
+            return false;
+        }
+
+        let (timed_out, paused) = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                self.is_server_side
                     && !state.authenticated
-                    && self.accepted_at.elapsed() > UNAUTH_TIMEOUT
-                {
-                    drop(state);
-                    self.close();
-                    break;
-                }
-                if state.backpressure || state.receive.len() >= QUEUE_LIMIT {
-                    drop(state);
-                    self.parse_available();
-                    thread::sleep(Duration::from_millis(2));
-                    continue;
-                }
-            }
-            match stream.read(&mut buffer) {
+                    && self.accepted_at.elapsed() > UNAUTH_TIMEOUT,
+                state.backpressure || state.receive.len() >= QUEUE_LIMIT,
+            )
+        };
+        if timed_out {
+            self.close();
+            return true;
+        }
+        if paused {
+            self.parse_available();
+            return false;
+        }
+
+        let mut buffer = [0u8; READ_CHUNK];
+        let mut total_read = 0usize;
+        let mut should_close = false;
+        let mut stream = self.reader_stream.lock().unwrap_or_else(|e| e.into_inner());
+
+        while total_read < READ_BUDGET {
+            let amount = READ_CHUNK.min(READ_BUDGET - total_read);
+            match stream.read(&mut buffer[..amount]) {
                 Ok(0) => {
-                    self.close();
+                    should_close = true;
                     break;
                 }
                 Ok(count) => {
+                    total_read += count;
                     let overflow = {
                         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                         if state.input.len().saturating_add(count) > MAX_INPUT_BUFFER {
@@ -793,71 +820,131 @@ impl Connection {
                         }
                     };
                     if overflow {
-                        self.close();
+                        should_close = true;
                         break;
                     }
+
                     self.parse_available();
+                    let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if state.closed || state.backpressure || state.receive.len() >= QUEUE_LIMIT {
+                        break;
+                    }
                 }
-                Err(error)
-                    if error.kind() == io::ErrorKind::WouldBlock
-                        || error.kind() == io::ErrorKind::TimedOut
-                        || error.kind() == io::ErrorKind::Interrupted =>
-                {
-                    self.parse_available();
-                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut => break,
                 Err(_) => {
-                    self.close();
+                    should_close = true;
                     break;
                 }
             }
         }
+        drop(stream);
+
+        if should_close {
+            self.close();
+            return true;
+        }
+        if total_read == 0 {
+            // There may be complete frames left in the input buffer after an
+            // application consumer frees space in the receive queue.
+            self.parse_available();
+        }
+        total_read > 0
     }
 
-    fn writer_loop(self: Arc<Self>, stream: &mut TcpStream) {
-        loop {
-            let pending = {
-                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                loop {
-                    if state.closed {
-                        return;
-                    }
-                    if let Some(pending) = state.send.pop_front() {
-                        state.queued_bytes = state
-                            .queued_bytes
-                            .saturating_sub(pending.payload.len().saturating_add(64));
-                        break pending;
-                    }
-                    state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
-                }
+    fn writer_step(&self) -> bool {
+        if self.is_closed() {
+            return false;
+        }
+
+        let mut stream = self.writer_stream.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut budget = WRITE_BUDGET;
+        let mut made_progress = false;
+        let mut should_close = false;
+
+        while budget > 0 && !state.closed {
+            if state.current_send.is_none() {
+                let Some(pending) = state.send.pop_front() else {
+                    break;
+                };
+                let queued_bytes = pending.payload.len().saturating_add(64);
+                let frame = make_frame(
+                    &self.magic1,
+                    &self.magic2,
+                    pending.authenticated,
+                    pending.eid,
+                    &pending.payload,
+                );
+                state.current_send = Some(InFlight {
+                    frame,
+                    offset: 0,
+                    queued_bytes,
+                    _lease: pending._lease,
+                });
+            }
+
+            let write_result = {
+                let current = state.current_send.as_mut().expect("in-flight frame exists");
+                let end = current
+                    .offset
+                    .saturating_add(WRITE_CHUNK)
+                    .min(current.frame.len())
+                    .min(current.offset.saturating_add(budget));
+                stream.write(&current.frame[current.offset..end]).map(|count| {
+                    (count, current.offset.saturating_add(count) >= current.frame.len())
+                })
             };
-            let frame = make_frame(
-                &self.magic1,
-                &self.magic2,
-                pending.authenticated,
-                pending.eid,
-                &pending.payload,
-            );
-            let mut offset = 0usize;
-            while offset < frame.len() {
-                let end = (offset + WRITE_CHUNK).min(frame.len());
-                match stream.write(&frame[offset..end]) {
-                    Ok(0) => {
-                        self.close();
-                        return;
-                    }
-                    Ok(count) => offset += count,
-                    Err(error)
-                        if error.kind() == io::ErrorKind::WouldBlock
-                            || error.kind() == io::ErrorKind::TimedOut
-                            || error.kind() == io::ErrorKind::Interrupted =>
-                    {
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                    Err(_) => {
-                        self.close();
-                        return;
+
+            match write_result {
+                Ok((0, _)) => {
+                    should_close = true;
+                    break;
+                }
+                Ok((count, complete)) => {
+                    let current = state.current_send.as_mut().expect("in-flight frame exists");
+                    current.offset += count;
+                    budget -= count;
+                    made_progress = true;
+                    if complete {
+                        let sent = state.current_send.take().expect("completed frame exists");
+                        state.queued_bytes = state.queued_bytes.saturating_sub(sent.queued_bytes);
+                        drop(sent);
+                        self.changed.notify_all();
                     }
                 }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut => break,
+                Err(_) => {
+                    should_close = true;
+                    break;
+                }
+            }
+        }
+
+        drop(state);
+        drop(stream);
+        if should_close {
+            self.close();
+            return true;
+        }
+        made_progress
+    }
+
+    fn reader_loop(self: Arc<Self>) {
+        while !self.is_closed() {
+            if !self.reader_step() {
+                thread::sleep(MAINLOOP_IDLE_SLEEP);
+            }
+        }
+    }
+
+    fn writer_loop(self: Arc<Self>) {
+        while !self.is_closed() {
+            if !self.writer_step() {
+                thread::sleep(MAINLOOP_IDLE_SLEEP);
             }
         }
     }
@@ -913,6 +1000,8 @@ struct ServerInner {
     stopped: AtomicBool,
     next_id: AtomicU64,
     listener_thread: Mutex<Option<JoinHandle<()>>>,
+    receive_thread: Mutex<Option<JoinHandle<()>>>,
+    send_thread: Mutex<Option<JoinHandle<()>>>,
     connections: Mutex<HashMap<u64, Arc<Connection>>>,
     temporary: Mutex<HashMap<Vec<u8>, Arc<Connection>>>,
     permanent: Mutex<HashMap<Vec<u8>, Arc<Connection>>>,
@@ -961,6 +1050,8 @@ impl TransportServer {
                 stopped: AtomicBool::new(false),
                 next_id: AtomicU64::new(1),
                 listener_thread: Mutex::new(None),
+                receive_thread: Mutex::new(None),
+                send_thread: Mutex::new(None),
                 connections: Mutex::new(HashMap::new()),
                 temporary: Mutex::new(HashMap::new()),
                 permanent: Mutex::new(HashMap::new()),
@@ -1036,6 +1127,41 @@ impl TransportServer {
             .listener_thread
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(thread);
+
+        let rx_inner = Arc::clone(&self.inner);
+        let rx_thread = match thread::Builder::new()
+            .name("network2-rx-mainloop".into())
+            .spawn(move || server_receive_loop(rx_inner))
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.inner.running.store(false, Ordering::Release);
+                if let Some(handle) = self.inner.listener_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    let _ = handle.join();
+                }
+                return Err(TransportError::Io(error.to_string()));
+            }
+        };
+        *self.inner.receive_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx_thread);
+
+        let tx_inner = Arc::clone(&self.inner);
+        let tx_thread = match thread::Builder::new()
+            .name("network2-tx-mainloop".into())
+            .spawn(move || server_send_loop(tx_inner))
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.inner.running.store(false, Ordering::Release);
+                if let Some(handle) = self.inner.listener_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    let _ = handle.join();
+                }
+                if let Some(handle) = self.inner.receive_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    let _ = handle.join();
+                }
+                return Err(TransportError::Io(error.to_string()));
+            }
+        };
+        *self.inner.send_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx_thread);
         Ok(())
     }
 
@@ -1228,6 +1354,12 @@ impl TransportServer {
         for conn in all {
             conn.close();
         }
+        if let Some(handle) = self.inner.receive_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.inner.send_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = handle.join();
+        }
         self.inner
             .temporary
             .lock()
@@ -1242,6 +1374,45 @@ impl TransportServer {
         self.inner.exchange_pool.stop();
         // Disconnect notifications are queued before this drain/stop.
         self.inner.disconnect_pool.stop();
+    }
+}
+
+
+fn server_receive_loop(inner: Arc<ServerInner>) {
+    while inner.running.load(Ordering::Acquire) {
+        let connections: Vec<Arc<Connection>> = inner
+            .connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let mut worked = false;
+        for connection in connections {
+            worked |= connection.reader_step();
+        }
+        if !worked {
+            thread::sleep(MAINLOOP_IDLE_SLEEP);
+        }
+    }
+}
+
+fn server_send_loop(inner: Arc<ServerInner>) {
+    while inner.running.load(Ordering::Acquire) {
+        let connections: Vec<Arc<Connection>> = inner
+            .connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let mut worked = false;
+        for connection in connections {
+            worked |= connection.writer_step();
+        }
+        if !worked {
+            thread::sleep(MAINLOOP_IDLE_SLEEP);
+        }
     }
 }
 
@@ -1274,8 +1445,6 @@ fn accept_loop(inner: Arc<ServerInner>, listener: TcpListener) {
                         let _ = socket.set_send_buffer_size(64 * 1024);
                         let _ = socket.set_keepalive(true);
                     }
-                    let _ = stream.set_read_timeout(Some(READ_TICK));
-                    let _ = stream.set_write_timeout(Some(READ_TICK));
                     if stream
                         .write_all(&[inner.magic1.as_slice(), inner.magic2.as_slice()].concat())
                         .is_err()
@@ -1442,8 +1611,6 @@ fn make_server_connection(inner: &Arc<ServerInner>, stream: TcpStream, peer_ip: 
             }
         }
     });
-    let reader = stream.try_clone()?;
-    let writer = stream.try_clone()?;
     let conn = Connection::new(
         id,
         Some(temp_id.clone()),
@@ -1468,7 +1635,7 @@ fn make_server_connection(inner: &Arc<ServerInner>, stream: TcpStream, peer_ip: 
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(temp_id, Arc::clone(&conn));
-    conn.start(reader, writer);
+    // The server-wide RX/TX mainloops service this connection.
     Ok(())
 }
 
@@ -1519,8 +1686,6 @@ impl TransportClient {
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         let mut greeting = [0u8; 16];
         stream.read_exact(&mut greeting)?;
-        stream.set_read_timeout(Some(READ_TICK))?;
-        stream.set_write_timeout(Some(READ_TICK))?;
         let magic1: [u8; 8] = greeting[..8].try_into().expect("8-byte magic");
         let magic2: [u8; 8] = greeting[8..].try_into().expect("8-byte magic");
         if magic1 == magic2 {
@@ -1543,8 +1708,6 @@ impl TransportClient {
                 }
             }));
         });
-        let reader = stream.try_clone()?;
-        let writer = stream.try_clone()?;
         let conn = Connection::new(
             1,
             None,
@@ -1560,7 +1723,7 @@ impl TransportClient {
             None,
         )?;
         *connection_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&conn));
-        conn.start(reader, writer);
+        conn.start();
         Ok(Self { conn })
     }
 
