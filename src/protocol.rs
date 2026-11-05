@@ -5,7 +5,7 @@ use crate::{crypto, transport};
 use pyo3::{prelude::*, types::PyBytes};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::Path,
@@ -30,6 +30,10 @@ const CLIENT_SALT_FILE: &str = "salt";
 const CLIENT_AUTH_FILE: &str = "auth_key";
 const CLIENT_SERVER_CERT_FILE: &str = "server_cert";
 const MAX_TIMEOUT: Duration = Duration::from_secs(10);
+// Concurrent recv() callers may finish processing in a different order than
+// frames arrived. Keep a bounded replay window instead of treating that benign
+// scheduling difference as a protocol-counter failure.
+const RECEIVE_REORDER_WINDOW: u64 = 4096;
 // Preserve the protocol's original 1 s / 5 s defaults. The benchmark scripts
 // may opt into longer windows because the Argon2id handshake KDF is expensive.
 const HANDSHAKE_FIRST_TIMEOUT: Duration = Duration::from_secs(1);
@@ -80,9 +84,29 @@ struct Session {
     key: Vec<u8>,
     send_counter: u64,
     receive_counter: u64,
+    receive_floor: u64,
+    received_counters: HashSet<u64>,
     admin: bool,
     username: Option<String>,
     connection_id: u64,
+}
+
+
+fn accept_receive_counter(session: &mut Session, counter: u64) -> PResult<()> {
+    if counter <= session.receive_floor || session.received_counters.contains(&counter) {
+        return Err(ProtocolFailure("Counter Error".into()));
+    }
+
+    if counter > session.receive_counter {
+        let oldest = counter.saturating_sub(RECEIVE_REORDER_WINDOW);
+        session.received_counters.retain(|seen| *seen >= oldest);
+        session.receive_counter = counter;
+    } else if session.receive_counter - counter >= RECEIVE_REORDER_WINDOW {
+        return Err(ProtocolFailure("Counter Error".into()));
+    }
+
+    session.received_counters.insert(counter);
+    Ok(())
 }
 
 struct ServerStorage {
@@ -360,6 +384,8 @@ impl ProtocolServer {
                 key,
                 send_counter: 1,
                 receive_counter: 0,
+                receive_floor: 0,
+                received_counters: HashSet::new(),
                 admin: false,
                 username: Some(username.to_string()),
                 connection_id,
@@ -492,6 +518,8 @@ impl ProtocolServer {
                 key,
                 send_counter: 3,
                 receive_counter: 2,
+                receive_floor: 2,
+                received_counters: HashSet::new(),
                 admin: false,
                 username: Some(fid),
                 connection_id,
@@ -579,6 +607,8 @@ impl ProtocolServer {
                 key: tss,
                 send_counter: 3,
                 receive_counter: 2,
+                receive_floor: 2,
+                received_counters: HashSet::new(),
                 admin: true,
                 username: None,
                 connection_id,
@@ -708,10 +738,7 @@ impl ProtocolServer {
         aad.push(b'0'); // client-to-server
         let mut session = session_arc.lock().unwrap_or_else(|e| e.into_inner());
         let plaintext = crypto::decrypt_gcm(&wire[8..], &session.key, Some(&aad))?;
-        if counter <= session.receive_counter {
-            return Err(ProtocolFailure("Counter Error".into()));
-        }
-        session.receive_counter = counter;
+        accept_receive_counter(&mut session, counter)?;
         Ok(Some(plaintext))
     }
 
@@ -1460,6 +1487,8 @@ impl ProtocolClient {
             key: tss,
             send_counter: 3,
             receive_counter: 2,
+            receive_floor: 2,
+            received_counters: HashSet::new(),
             admin: true,
             username: None,
             connection_id: 1,
@@ -1493,6 +1522,8 @@ impl ProtocolClient {
             key,
             send_counter,
             receive_counter,
+            receive_floor: receive_counter,
+            received_counters: HashSet::new(),
             admin: false,
             username: None,
             connection_id: 1,
