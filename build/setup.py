@@ -638,8 +638,12 @@ def msvc_environment() -> dict[str, str]:
         # Keep this as a single cmd.exe command string. CALL is required for
         # a .bat file so that SET runs after vcvarsall returns to this shell.
         command = f'call "{vcvars}" x64 && set'
+        # Pass the command string through COMSPEC. Passing cmd.exe /c as an
+        # argv list makes Python escape the embedded quotes on Windows, causing
+        # cmd.exe to treat the quotes around vcvarsall.bat as literal characters.
         result = subprocess.run(
-            [comspec, "/d", "/c", command],
+            command,
+            shell=True,
             capture_output=True, text=True, errors="replace",
         )
         if result.returncode != 0:
