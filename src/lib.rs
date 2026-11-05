@@ -195,7 +195,7 @@ impl TCPServer {
                     _ => return,
                 };
                 if client_pub.starts_with(b"REQ_ADMIN") {
-                    let client_init_pub = client_pub[9:].to_vec();
+                    let client_init_pub = client_pub[9..].to_vec();
                     let init_key = match Encryption::gen_x25519(true) {
                         Ok(k) => k,
                         Err(_) => return,
@@ -239,7 +239,7 @@ impl TCPServer {
                         let mut aad = ctr.to_vec();
                         aad.extend_from_slice(b"0");
                         let target_key = if defined { ekey } else { &tss };
-                        let out = Encryption::decryptGCM(&payload[8:], target_key, Some(&aad))
+                        let out = Encryption::decryptGCM(&payload[8..], target_key, Some(&aad))
                             .map_err(|e| ProtocolError::new(e.to_string()))?;
                         Ok(out)
                     };
@@ -459,7 +459,7 @@ impl TCPServer {
         let mut aad = target_eid.to_vec();
         aad.extend_from_slice(ctr_bytes);
         aad.extend_from_slice(b"0");
-        let decrypted = Encryption::decryptGCM(&raw[8:], &ekey, Some(&aad))
+        let decrypted = Encryption::decryptGCM(&raw[8..], &ekey, Some(&aad))
             .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
         let mut counters = self.counters.lock().unwrap();
         let [sc, rc] = counters.get_mut(cid_bytes).ok_or_else(|| PyErr::new::<ProtocolError, _>(ProtocolError::new("Client is not authenticated".into())))?;
@@ -628,7 +628,7 @@ impl TCPClient {
         let mut aad = target_eid.to_vec();
         aad.extend_from_slice(ctr_bytes);
         aad.extend_from_slice(b"1");
-        let decrypted = Encryption::decryptGCM(&raw[8:], &ekey, Some(&aad))
+        let decrypted = Encryption::decryptGCM(&raw[8..], &ekey, Some(&aad))
             .map_err(|e| PyErr::new::<ProtocolError, _>(ProtocolError::new(e.to_string())))?;
         Ok(Some(PyBytes::new(py, &decrypted).into()))
     }
@@ -729,7 +729,7 @@ impl TCPClient {
                 *rc_val = counter;
                 let mut aad = ctr.to_vec();
                 aad.extend_from_slice(b"1");
-                Encryption::decryptGCM(&wire[8:], &tss, Some(&aad))
+                Encryption::decryptGCM(&wire[8..], &tss, Some(&aad))
                     .map_err(|e| ProtocolError::new(e.to_string()))
             };
             let mut nonce2 = [0u8; 32];
@@ -854,7 +854,7 @@ impl TCPClient {
                     *rc_val = counter;
                     let mut aad = ctr.to_vec();
                     aad.extend_from_slice(b"1");
-                    Encryption::decryptGCM(&wire[8:], &tss, Some(&aad))
+                    Encryption::decryptGCM(&wire[8..], &tss, Some(&aad))
                         .map_err(|e| ProtocolError::new(e.to_string()))
                 };
                 let mut nonce2 = [0u8; 32];
