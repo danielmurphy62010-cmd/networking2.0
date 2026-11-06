@@ -644,7 +644,7 @@ struct Session {
     send_counter: [u64; PORT_PAIR_COUNT],
     receive_counter: [u64; PORT_PAIR_COUNT],
     last_received_hash: [Option<[u8; 32]>; PORT_PAIR_COUNT],
-    send_gate: Arc<Mutex<()>>,
+    send_gate: [Arc<Mutex<()>>; PORT_PAIR_COUNT],
     admin: bool,
     username: Option<String>,
     connection_id: u64,
@@ -1294,7 +1294,7 @@ impl ProtocolServer {
                 username: Some(username.to_string()),
                 connection_id,
                 last_received_hash: [None; PORT_PAIR_COUNT],
-                send_gate: Arc::new(Mutex::new(())),
+                send_gate: std::array::from_fn(|_| Arc::new(Mutex::new(()))),
             },
         )
     }
@@ -1428,7 +1428,7 @@ impl ProtocolServer {
                 username: Some(fid),
                 connection_id,
                 last_received_hash: [None; PORT_PAIR_COUNT],
-                send_gate: Arc::new(Mutex::new(())),
+                send_gate: std::array::from_fn(|_| Arc::new(Mutex::new(()))),
             },
         )
     }
@@ -1517,7 +1517,7 @@ impl ProtocolServer {
                 username: None,
                 connection_id,
                 last_received_hash: [None; PORT_PAIR_COUNT],
-                send_gate: Arc::new(Mutex::new(())),
+                send_gate: std::array::from_fn(|_| Arc::new(Mutex::new(()))),
             },
         )
     }
@@ -1627,21 +1627,21 @@ impl ProtocolServer {
     }
 
     pub fn send(&self, payload: &[u8], eid: Option<&[u8]>, client_id: &[u8]) -> PResult<Vec<u8>> {
-        let session_arc = self.session(client_id)?;
-        let send_gate = {
-            session_arc
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .send_gate
-                .clone()
-        };
-        let _send_guard = send_gate.lock().unwrap_or_else(|e| e.into_inner());
         let exchange: [u8; 8] = match eid {
             Some(value) => exact_eid(value)?,
             None => crypto::random_bytes(8)?.try_into().expect("8 random bytes"),
         };
         let pair_index = self.pair_for_eid(client_id, &exchange)
             .ok_or_else(|| ProtocolFailure("client has no assigned port pair".into()))?;
+        let session_arc = self.session(client_id)?;
+        let send_gate = {
+            session_arc
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .send_gate[pair_index]
+                .clone()
+        };
+        let _send_guard = send_gate.lock().unwrap_or_else(|e| e.into_inner());
         let counter: u64;
         let wire_payload: Vec<u8>;
         {
@@ -2811,7 +2811,7 @@ impl ProtocolClient {
             username: None,
             connection_id: 1,
             last_received_hash: [None; PORT_PAIR_COUNT],
-            send_gate: Arc::new(Mutex::new(())),
+            send_gate: std::array::from_fn(|_| Arc::new(Mutex::new(()))),
         });
         self.receive_pair_assignment(transport, &tss)?;
         transport.auth_finished()?;
@@ -2848,7 +2848,7 @@ impl ProtocolClient {
             username: None,
             connection_id: 1,
             last_received_hash: [None; PORT_PAIR_COUNT],
-            send_gate: Arc::new(Mutex::new(())),
+            send_gate: std::array::from_fn(|_| Arc::new(Mutex::new(()))),
         });
         self.receive_pair_assignment(transport, &assignment_key)?;
         transport.auth_finished()?;
@@ -2856,20 +2856,20 @@ impl ProtocolClient {
     }
 
     pub fn send(&self, payload: &[u8], eid: Option<&[u8]>) -> PResult<Vec<u8>> {
-        let send_gate = {
-            let session_guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
-            session_guard
-                .as_ref()
-                .ok_or_else(|| ProtocolFailure("client is not authenticated".into()))?
-                .send_gate
-                .clone()
-        };
-        let _send_guard = send_gate.lock().unwrap_or_else(|e| e.into_inner());
         let exchange: [u8; 8] = match eid {
             Some(value) => exact_eid(value)?,
             None => crypto::random_bytes(8)?.try_into().expect("8 random bytes"),
         };
         let pair_index = self.pair_for_eid(&exchange)?;
+        let send_gate = {
+            let session_guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            session_guard
+                .as_ref()
+                .ok_or_else(|| ProtocolFailure("client is not authenticated".into()))?
+                .send_gate[pair_index]
+                .clone()
+        };
+        let _send_guard = send_gate.lock().unwrap_or_else(|e| e.into_inner());
         let counter: u64;
         let wire_payload: Vec<u8>;
         {
