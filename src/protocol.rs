@@ -109,6 +109,7 @@ const DATA_FINISH_MAGIC: &[u8; 8] = b"N2DATAF1";
 const DATA_HELLO_TAG: &[u8; 8] = b"DHELLO1!";
 const DATA_CHALLENGE_TAG: &[u8; 8] = b"DCHALN1!";
 const DATA_FINISH_TAG: &[u8; 8] = b"DFINISH!";
+const DATA_READY_MAGIC: &[u8; 8] = b"N2DATAR1";
 const DATA_READY_TAG: &[u8; 8] = b"DREADY1!";
 
 fn ack_control_key(session_key: &[u8]) -> Vec<u8> {
@@ -2154,9 +2155,13 @@ impl Drop for ProtocolServer {
 }
 
 pub struct ProtocolClient {
+    base_port: u16,
+    // The base connection carries only handshake/control messages.
     transport: Mutex<Option<transport::TransportClient>>,
-    ack_transport: Mutex<Option<transport::TransportClient>>,
-    ack_channel: Mutex<Option<Arc<AckChannel>>>,
+    data_transports: Mutex<HashMap<usize, transport::TransportClient>>,
+    ack_transports: Mutex<HashMap<usize, transport::TransportClient>>,
+    ack_channels: Mutex<HashMap<usize, Arc<AckChannel>>>,
+    assigned_pairs: Mutex<Option<[usize; PORT_PAIRS_PER_CLIENT]>>,
     session: Mutex<Option<Session>>,
     callback: Option<Py<PyAny>>,
     python_self: Mutex<Option<Py<PyAny>>>,
@@ -2171,12 +2176,16 @@ impl ProtocolClient {
         admin_auth_code: Option<String>,
         callback: Option<Py<PyAny>>,
         simult_exchanges: usize,
-        requested_ack_port: Option<u16>,
+        _requested_ack_port: Option<u16>,
     ) -> PResult<Arc<Self>> {
         if !(1..=64).contains(&simult_exchanges) {
             return Err(ProtocolFailure("simult_exchanges must be between 1 and 64".into()));
         }
-        let ack_port = resolve_ack_port(port, requested_ack_port)?;
+        if port == 0 || port.checked_add((PORT_PAIR_COUNT * 2) as u16).is_none() {
+            return Err(ProtocolFailure(
+                "base port must be between 1 and 65515 so all 21 ports fit".into(),
+            ));
+        }
         let is_admin = admin_auth_code.is_some();
         let identity = if is_admin {
             None
@@ -2184,21 +2193,19 @@ impl ProtocolClient {
             Some(prepare_client_identity(&password)?)
         };
         let client = Arc::new(Self {
+            base_port: port,
             transport: Mutex::new(None),
-            ack_transport: Mutex::new(None),
-            ack_channel: Mutex::new(None),
+            data_transports: Mutex::new(HashMap::new()),
+            ack_transports: Mutex::new(HashMap::new()),
+            ack_channels: Mutex::new(HashMap::new()),
+            assigned_pairs: Mutex::new(None),
             session: Mutex::new(None),
             callback,
             python_self: Mutex::new(None),
             closed: AtomicBool::new(false),
         });
-        let weak = Arc::downgrade(&client);
-        let exchange = Arc::new(move |eid: [u8; 8]| {
-            if let Some(client) = weak.upgrade() {
-                client.dispatch_exchange(eid);
-            }
-        });
-        let transport = transport::TransportClient::connect(&host, port, simult_exchanges, exchange)?;
+        let noop: Arc<dyn Fn([u8; 8]) + Send + Sync> = Arc::new(|_| {});
+        let transport = transport::TransportClient::connect(&host, port, simult_exchanges, noop)?;
         *client.transport.lock().unwrap_or_else(|e| e.into_inner()) = Some(transport.clone());
         let auth_result = if let Some(code) = admin_auth_code {
             client.handshake_admin(&transport, &code)
@@ -2206,25 +2213,204 @@ impl ProtocolClient {
             client.handshake_non_admin(&transport, identity.expect("non-admin identity"))
         };
         if let Err(error) = auth_result {
-            transport.close();
+            client.close();
             return Err(error);
         }
-        if let Err(error) = client.connect_ack_channel(&host, ack_port, simult_exchanges) {
-            transport.close();
+        if let Err(error) = client.connect_assigned_pairs(&host, simult_exchanges) {
+            client.close();
             return Err(error);
         }
         Ok(client)
     }
 
+    fn receive_pair_assignment(
+        &self,
+        transport: &transport::TransportClient,
+        session_key: &[u8],
+    ) -> PResult<()> {
+        let frame = recv_client_handshake_required(
+            transport,
+            ACK_CONNECT_TIMEOUT,
+            "encrypted port-pair assignment",
+        )?;
+        let pairs = decode_port_assignment(&frame, session_key)?;
+        *self.assigned_pairs.lock().unwrap_or_else(|e| e.into_inner()) = Some(pairs);
+        Ok(())
+    }
+
+    fn assigned_pairs(&self) -> PResult<[usize; PORT_PAIRS_PER_CLIENT]> {
+        self.assigned_pairs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .copied()
+            .ok_or_else(|| ProtocolFailure("server has not assigned bulk port pairs".into()))
+    }
+
+    fn pair_for_eid(&self, eid: &[u8; 8]) -> PResult<usize> {
+        Ok(selected_pair(eid, &self.assigned_pairs()?))
+    }
+
+    fn data_transport(&self, pair_index: usize) -> PResult<transport::TransportClient> {
+        self.data_transports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pair_index)
+            .cloned()
+            .ok_or_else(|| ProtocolFailure("bulk transport for EID is not connected".into()))
+    }
+
+    fn ack_channel(&self, pair_index: usize) -> PResult<Arc<AckChannel>> {
+        self.ack_channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pair_index)
+            .cloned()
+            .ok_or_else(|| ProtocolFailure("ACK channel for EID is not connected".into()))
+    }
+
+    fn connect_assigned_pairs(
+        self: &Arc<Self>,
+        host: &str,
+        simult_exchanges: usize,
+    ) -> PResult<()> {
+        for pair_index in self.assigned_pairs()? {
+            self.connect_data_port(host, pair_index, simult_exchanges)?;
+            self.connect_ack_channel(host, pair_index, simult_exchanges)?;
+        }
+        Ok(())
+    }
+
+    fn connect_data_port(
+        self: &Arc<Self>,
+        host: &str,
+        pair_index: usize,
+        simult_exchanges: usize,
+    ) -> PResult<()> {
+        let weak = Arc::downgrade(self);
+        let callback: Arc<dyn Fn([u8; 8]) + Send + Sync> = Arc::new(move |eid| {
+            if let Some(client) = weak.upgrade() {
+                if client.pair_for_eid(&eid).ok() == Some(pair_index) {
+                    client.dispatch_exchange(eid);
+                } else {
+                    eprintln!("network2: server sent EID to an unassigned bulk pair");
+                }
+            }
+        });
+        let data_transport = transport::TransportClient::connect(
+            host,
+            self.base_port + 1 + (pair_index as u16 * 2),
+            simult_exchanges,
+            callback,
+        )?;
+
+        let (control_key, key_id) = {
+            let session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            let session = session.as_ref()
+                .ok_or_else(|| ProtocolFailure("client is not authenticated".into()))?;
+            let control_key = ack_control_key(&session.key);
+            let key_id = ack_control_key_id(&control_key);
+            (control_key, key_id)
+        };
+
+        let setup = (|| -> PResult<()> {
+            let client_nonce = crypto::random_bytes(32)?;
+            let mut hello_plain = DATA_HELLO_TAG.to_vec();
+            hello_plain.extend_from_slice(&client_nonce);
+            let hello_aad = port_handshake_aad(b"data", b"client-hello", pair_index, &key_id);
+            let hello_encrypted = crypto::encrypt_gcm(
+                &hello_plain, &control_key, Some(&hello_aad),
+            )?;
+            let mut hello = DATA_HELLO_MAGIC.to_vec();
+            hello.extend_from_slice(&key_id);
+            hello.extend_from_slice(&hello_encrypted);
+            data_transport.send_handshake(hello)?;
+
+            let challenge = recv_client_handshake_required(
+                &data_transport, ACK_CONNECT_TIMEOUT, "bulk-channel challenge",
+            )?;
+            if challenge.len() < DATA_CHALLENGE_MAGIC.len() + 8 + crypto::AES_GCM_OVERHEAD
+                || &challenge[..DATA_CHALLENGE_MAGIC.len()] != DATA_CHALLENGE_MAGIC
+            {
+                return Err(ProtocolFailure("invalid bulk-channel challenge".into()));
+            }
+            let challenge_aad =
+                port_handshake_aad(b"data", b"server-challenge", pair_index, &key_id);
+            let challenge_plain = crypto::decrypt_gcm(
+                &challenge[DATA_CHALLENGE_MAGIC.len()..],
+                &control_key,
+                Some(&challenge_aad),
+            )?;
+            if challenge_plain.len() != 72
+                || !ct_equal(&challenge_plain[..8], DATA_CHALLENGE_TAG)
+                || !ct_equal(&challenge_plain[8..40], &client_nonce)
+            {
+                return Err(ProtocolFailure("bulk-channel challenge proof failed".into()));
+            }
+            let server_nonce = challenge_plain[40..72].to_vec();
+            let channel_key = port_channel_key(
+                &control_key, &client_nonce, &server_nonce, b"data", pair_index,
+            );
+
+            let mut finish_plain = DATA_FINISH_TAG.to_vec();
+            finish_plain.extend_from_slice(&client_nonce);
+            finish_plain.extend_from_slice(&server_nonce);
+            let finish_aad = port_handshake_aad(b"data", b"client-finish", pair_index, &key_id);
+            let finish_encrypted = crypto::encrypt_gcm(
+                &finish_plain, &control_key, Some(&finish_aad),
+            )?;
+            let mut finish = DATA_FINISH_MAGIC.to_vec();
+            finish.extend_from_slice(&finish_encrypted);
+            data_transport.send_handshake(finish)?;
+
+            let ready = recv_client_handshake_required(
+                &data_transport, ACK_CONNECT_TIMEOUT, "bulk-channel ready proof",
+            )?;
+            if ready.len() < DATA_READY_MAGIC.len() + 8 + crypto::AES_GCM_OVERHEAD
+                || &ready[..DATA_READY_MAGIC.len()] != DATA_READY_MAGIC
+            {
+                return Err(ProtocolFailure("invalid bulk-channel ready frame".into()));
+            }
+            let ready_aad = port_handshake_aad(b"data", b"server-ready", pair_index, &key_id);
+            let ready_plain = crypto::decrypt_gcm(
+                &ready[DATA_READY_MAGIC.len()..],
+                &channel_key,
+                Some(&ready_aad),
+            )?;
+            if ready_plain.len() != 9
+                || !ct_equal(&ready_plain[..8], DATA_READY_TAG)
+                || ready_plain[8] as usize != pair_index
+            {
+                return Err(ProtocolFailure("bulk-channel ready proof failed".into()));
+            }
+            data_transport.auth_finished()?;
+            Ok(())
+        })();
+
+        if let Err(error) = setup {
+            data_transport.close();
+            return Err(error);
+        }
+        self.data_transports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pair_index, data_transport);
+        Ok(())
+    }
+
     fn connect_ack_channel(
         &self,
         host: &str,
-        ack_port: u16,
+        pair_index: usize,
         simult_exchanges: usize,
     ) -> PResult<()> {
         let noop: Arc<dyn Fn([u8; 8]) + Send + Sync> = Arc::new(|_| {});
-        let ack_transport =
-            transport::TransportClient::connect(host, ack_port, simult_exchanges, noop)?;
+        let ack_transport = transport::TransportClient::connect(
+            host,
+            self.base_port + 2 + (pair_index as u16 * 2),
+            simult_exchanges,
+            noop,
+        )?;
 
         let (control_key, key_id) = {
             let session = self.session.lock().unwrap_or_else(|e| e.into_inner());
@@ -2241,7 +2427,7 @@ impl ProtocolClient {
             let mut hello_plain = Vec::with_capacity(40);
             hello_plain.extend_from_slice(ACK_HELLO_TAG);
             hello_plain.extend_from_slice(&client_nonce);
-            let hello_aad = ack_handshake_aad(b"client-hello", &key_id);
+            let hello_aad = port_handshake_aad(b"ack", b"client-hello", pair_index, &key_id);
             let hello_encrypted =
                 crypto::encrypt_gcm(&hello_plain, &control_key, Some(&hello_aad))?;
             let mut hello = ACK_HELLO_MAGIC.to_vec();
@@ -2252,14 +2438,15 @@ impl ProtocolClient {
             let challenge = recv_client_handshake_required(
                 &ack_transport,
                 ACK_CONNECT_TIMEOUT,
-                "secondary-channel challenge",
+                "ACK-channel challenge",
             )?;
             if challenge.len() < ACK_CHALLENGE_MAGIC.len() + 8 + crypto::AES_GCM_OVERHEAD
                 || &challenge[..ACK_CHALLENGE_MAGIC.len()] != ACK_CHALLENGE_MAGIC
             {
-                return Err(ProtocolFailure("invalid secondary-channel challenge".into()));
+                return Err(ProtocolFailure("invalid ACK-channel challenge".into()));
             }
-            let challenge_aad = ack_handshake_aad(b"server-challenge", &key_id);
+            let challenge_aad =
+                port_handshake_aad(b"ack", b"server-challenge", pair_index, &key_id);
             let challenge_plain = crypto::decrypt_gcm(
                 &challenge[ACK_CHALLENGE_MAGIC.len()..],
                 &control_key,
@@ -2269,16 +2456,18 @@ impl ProtocolClient {
                 || !ct_equal(&challenge_plain[..8], ACK_CHALLENGE_TAG)
                 || !ct_equal(&challenge_plain[8..40], &client_nonce)
             {
-                return Err(ProtocolFailure("secondary-channel challenge proof failed".into()));
+                return Err(ProtocolFailure("ACK-channel challenge proof failed".into()));
             }
             let server_nonce = challenge_plain[40..72].to_vec();
-            let channel_key = ack_channel_key(&control_key, &client_nonce, &server_nonce);
+            let channel_key = port_channel_key(
+                &control_key, &client_nonce, &server_nonce, b"ack", pair_index,
+            );
 
             let mut finish_plain = Vec::with_capacity(72);
             finish_plain.extend_from_slice(ACK_FINISH_TAG);
             finish_plain.extend_from_slice(&client_nonce);
             finish_plain.extend_from_slice(&server_nonce);
-            let finish_aad = ack_handshake_aad(b"client-finish", &key_id);
+            let finish_aad = port_handshake_aad(b"ack", b"client-finish", pair_index, &key_id);
             let finish_encrypted =
                 crypto::encrypt_gcm(&finish_plain, &control_key, Some(&finish_aad))?;
             let mut finish = ACK_FINISH_MAGIC.to_vec();
@@ -2286,13 +2475,11 @@ impl ProtocolClient {
             ack_transport.send_handshake(finish)?;
             ack_transport.auth_finished()?;
 
-            // Wait until the server has authenticated and installed its side
-            // of the secondary channel before the main TCP session is exposed.
             let ready = ack_transport
                 .recv(&ACK_EID, Some(ACK_CONNECT_TIMEOUT))?
-                .ok_or_else(|| ProtocolFailure("secondary-channel ready message timed out".into()))?;
+                .ok_or_else(|| ProtocolFailure("ACK-channel ready message timed out".into()))?;
             if ready.len() < 8 + crypto::AES_GCM_OVERHEAD {
-                return Err(ProtocolFailure("secondary-channel ready message is too short".into()));
+                return Err(ProtocolFailure("ACK-channel ready message is too short".into()));
             }
             let ready_counter = u64::from_be_bytes(
                 ready[..8].try_into().expect("eight-byte ready counter"),
@@ -2300,9 +2487,8 @@ impl ProtocolClient {
             let ready_aad = ack_record_aad(b'1', ready_counter);
             let ready_plain = crypto::decrypt_gcm(&ready[8..], &channel_key, Some(&ready_aad))?;
             if ready_counter != 1 || !ct_equal(&ready_plain, ACK_READY_TAG) {
-                return Err(ProtocolFailure("secondary-channel ready proof failed".into()));
+                return Err(ProtocolFailure("ACK-channel ready proof failed".into()));
             }
-
             Ok(Arc::new(AckChannel::client(
                 channel_key,
                 ack_transport.clone(),
@@ -2321,18 +2507,20 @@ impl ProtocolClient {
             ack_transport.close();
             return Err(error);
         }
-        *self.ack_transport.lock().unwrap_or_else(|e| e.into_inner()) = Some(ack_transport);
-        *self.ack_channel.lock().unwrap_or_else(|e| e.into_inner()) = Some(channel);
+        self.ack_transports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pair_index, ack_transport);
+        self.ack_channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pair_index, channel);
         Ok(())
     }
 
-    fn ack_channel(&self) -> PResult<Arc<AckChannel>> {
-        self.ack_channel
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| ProtocolFailure("secondary ACK channel is not connected".into()))
+    fn ack_channel_for_eid(&self, eid: &[u8; 8]) -> PResult<Arc<AckChannel>> {
+        let pair_index = self.pair_for_eid(eid)?;
+        self.ack_channel(pair_index)
     }
 
     pub fn set_python_self(&self, object: Py<PyAny>) {
