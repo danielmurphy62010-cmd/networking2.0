@@ -2808,7 +2808,7 @@ impl ProtocolClient {
             return Err(ProtocolFailure("admin server proof mismatch".into()));
         }
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(Session {
-            key: tss,
+            key: tss.clone(),
             send_counter: 3,
             receive_counter: 2,
             admin: true,
@@ -2817,6 +2817,7 @@ impl ProtocolClient {
             last_received_hash: None,
             send_gate: Arc::new(Mutex::new(())),
         });
+        self.receive_pair_assignment(transport, &tss)?;
         transport.auth_finished()?;
         Ok(())
     }
@@ -2842,6 +2843,7 @@ impl ProtocolClient {
             &Path::new(CLIENT_DIR).join(CLIENT_SERVER_CERT_FILE),
             &cert_signature,
         )?;
+        let assignment_key = key.clone();
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(Session {
             key,
             send_counter,
@@ -2852,6 +2854,7 @@ impl ProtocolClient {
             last_received_hash: None,
             send_gate: Arc::new(Mutex::new(())),
         });
+        self.receive_pair_assignment(transport, &assignment_key)?;
         transport.auth_finished()?;
         Ok(())
     }
@@ -2894,8 +2897,9 @@ impl ProtocolClient {
             wire.extend_from_slice(&encrypted);
             wire_payload = wire;
         }
-        let ack = self.ack_channel()?;
-        let transport = self.transport()?;
+        let pair_index = self.pair_for_eid(&exchange)?;
+        let ack = self.ack_channel(pair_index)?;
+        let transport = self.data_transport(pair_index)?;
         send_data_with_ack(&ack, counter, || {
             transport.send(wire_payload.clone(), Some(exchange.to_vec()))?;
             Ok(())
@@ -2911,8 +2915,9 @@ impl ProtocolClient {
 
     fn recv_internal(&self, eid: &[u8], timeout: Option<Duration>) -> PResult<Option<Vec<u8>>> {
         let exchange = exact_eid(eid)?;
-        let ack = self.ack_channel()?;
-        let transport = self.transport()?;
+        let pair_index = self.pair_for_eid(&exchange)?;
+        let ack = self.ack_channel(pair_index)?;
+        let transport = self.data_transport(pair_index)?;
         let deadline = timeout.map(|value| Instant::now() + value);
         loop {
             let remaining = deadline.map(|value| value.saturating_duration_since(Instant::now()));
@@ -2956,7 +2961,13 @@ impl ProtocolClient {
     }
 
     pub fn set_backpressure(&self, enabled: bool) -> PResult<()> {
-        self.transport()?.set_backpressure(enabled);
+        let transports = self.data_transports.lock().unwrap_or_else(|e| e.into_inner());
+        if transports.len() != PORT_PAIRS_PER_CLIENT {
+            return Err(ProtocolFailure("not all assigned bulk channels are connected".into()));
+        }
+        for transport in transports.values() {
+            transport.set_backpressure(enabled);
+        }
         Ok(())
     }
 
@@ -2964,20 +2975,25 @@ impl ProtocolClient {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let Some(channel) = self
-            .ack_channel
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+        let channels = {
+            let mut channels = self.ack_channels.lock().unwrap_or_else(|e| e.into_inner());
+            channels.drain().map(|(_, channel)| channel).collect::<Vec<_>>()
+        };
+        for channel in channels {
             channel.close();
         }
-        if let Some(transport) = self
-            .ack_transport
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+        let ack_transports = {
+            let mut transports = self.ack_transports.lock().unwrap_or_else(|e| e.into_inner());
+            transports.drain().map(|(_, transport)| transport).collect::<Vec<_>>()
+        };
+        for transport in ack_transports {
+            transport.close();
+        }
+        let data_transports = {
+            let mut transports = self.data_transports.lock().unwrap_or_else(|e| e.into_inner());
+            transports.drain().map(|(_, transport)| transport).collect::<Vec<_>>()
+        };
+        for transport in data_transports {
             transport.close();
         }
         if let Some(transport) = self
@@ -2989,17 +3005,22 @@ impl ProtocolClient {
             transport.close();
         }
         self.session.lock().unwrap_or_else(|e| e.into_inner()).take();
+        self.assigned_pairs.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 
     pub fn is_authed(&self) -> bool {
-        self.session.lock().unwrap_or_else(|e| e.into_inner()).is_some()
-            && self.transport().is_ok_and(|transport| transport.is_authed())
-            && self
-                .ack_channel
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .is_some_and(|channel| !channel.closed.load(Ordering::Acquire))
+        let base_authed = self.session.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+            && self.transport().is_ok_and(|transport| transport.is_authed());
+        if !base_authed {
+            return false;
+        }
+        let Ok(pairs) = self.assigned_pairs() else { return false };
+        let data = self.data_transports.lock().unwrap_or_else(|e| e.into_inner());
+        let acks = self.ack_channels.lock().unwrap_or_else(|e| e.into_inner());
+        pairs.iter().all(|pair| {
+            data.get(pair).is_some_and(|transport| transport.is_authed())
+                && acks.get(pair).is_some_and(|channel| !channel.closed.load(Ordering::Acquire))
+        })
     }
 
     pub fn magic1(&self) -> PResult<Vec<u8>> {
