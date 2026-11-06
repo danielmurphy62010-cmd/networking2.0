@@ -540,7 +540,11 @@ fn decode_data_record(
     wire: &[u8],
     exchange: &[u8; 8],
     direction: u8,
+    pair_index: usize,
 ) -> PResult<ReceivedData> {
+    if pair_index >= PORT_PAIRS_PER_CLIENT {
+        return Err(ProtocolFailure("invalid EID-selected port pair index".into()));
+    }
     if wire.len() < 8 {
         return Err(ProtocolFailure("encrypted message is too short".into()));
     }
@@ -557,10 +561,12 @@ fn decode_data_record(
         Err(_) => return Ok(ReceivedData::Rejected { counter }),
     };
     let fingerprint = *blake3::hash(wire).as_bytes();
-    if counter == session.receive_counter && session.last_received_hash == Some(fingerprint) {
+    if counter == session.receive_counter[pair_index]
+        && session.last_received_hash[pair_index] == Some(fingerprint)
+    {
         return Ok(ReceivedData::Duplicate { counter });
     }
-    if counter <= session.receive_counter {
+    if counter <= session.receive_counter[pair_index] {
         return Ok(ReceivedData::Rejected { counter });
     }
     Ok(ReceivedData::Fresh {
@@ -633,9 +639,11 @@ fn spawn_client_ack_reader(
 
 struct Session {
     key: Vec<u8>,
-    send_counter: u64,
-    receive_counter: u64,
-    last_received_hash: Option<[u8; 32]>,
+    // Counters are independent per EID-selected port pair. TCP ordering is
+    // guaranteed within a pair, but not across the four parallel sockets.
+    send_counter: [u64; PORT_PAIRS_PER_CLIENT],
+    receive_counter: [u64; PORT_PAIRS_PER_CLIENT],
+    last_received_hash: [Option<[u8; 32]>; PORT_PAIRS_PER_CLIENT],
     send_gate: Arc<Mutex<()>>,
     admin: bool,
     username: Option<String>,
@@ -1280,12 +1288,12 @@ impl ProtocolServer {
             cid,
             Session {
                 key,
-                send_counter: 1,
-                receive_counter: 0,
+                send_counter: [1; PORT_PAIRS_PER_CLIENT],
+                receive_counter: [0; PORT_PAIRS_PER_CLIENT],
                 admin: false,
                 username: Some(username.to_string()),
                 connection_id,
-                last_received_hash: None,
+                last_received_hash: [None; PORT_PAIRS_PER_CLIENT],
                 send_gate: Arc::new(Mutex::new(())),
             },
         )
@@ -1414,12 +1422,12 @@ impl ProtocolServer {
             cid,
             Session {
                 key,
-                send_counter: 3,
-                receive_counter: 2,
+                send_counter: [3; PORT_PAIRS_PER_CLIENT],
+                receive_counter: [2; PORT_PAIRS_PER_CLIENT],
                 admin: false,
                 username: Some(fid),
                 connection_id,
-                last_received_hash: None,
+                last_received_hash: [None; PORT_PAIRS_PER_CLIENT],
                 send_gate: Arc::new(Mutex::new(())),
             },
         )
@@ -1698,7 +1706,7 @@ impl ProtocolServer {
             let wire = transport.recv(client_id, &exchange, remaining)?;
             let Some(wire) = wire else { return Ok(None) };
             let mut session = session_arc.lock().unwrap_or_else(|e| e.into_inner());
-            match decode_data_record(&mut session, &wire, &exchange, b'0')? {
+            match decode_data_record(&mut session, &wire, &exchange, b'0', pair_index)? {
                 ReceivedData::Fresh {
                     counter,
                     plaintext,
@@ -1707,8 +1715,8 @@ impl ProtocolServer {
                     // Commit delivery state only after the authenticated ACK
                     // has entered the independent control channel's send queue.
                     ack.send_status(true, b'0', counter)?;
-                    session.receive_counter = counter;
-                    session.last_received_hash = Some(fingerprint);
+                    session.receive_counter[pair_index] = counter;
+                    session.last_received_hash[pair_index] = Some(fingerprint);
                     return Ok(Some(plaintext));
                 }
                 ReceivedData::Duplicate { counter } => {
@@ -2809,8 +2817,8 @@ impl ProtocolClient {
         }
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(Session {
             key: tss.clone(),
-            send_counter: 3,
-            receive_counter: 2,
+            send_counter: [3; PORT_PAIRS_PER_CLIENT],
+            receive_counter: [2; PORT_PAIRS_PER_CLIENT],
             admin: true,
             username: None,
             connection_id: 1,
@@ -2846,12 +2854,12 @@ impl ProtocolClient {
         let assignment_key = key.clone();
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(Session {
             key,
-            send_counter,
-            receive_counter,
+            send_counter: [send_counter; PORT_PAIRS_PER_CLIENT],
+            receive_counter: [receive_counter; PORT_PAIRS_PER_CLIENT],
             admin: false,
             username: None,
             connection_id: 1,
-            last_received_hash: None,
+            last_received_hash: [None; PORT_PAIRS_PER_CLIENT],
             send_gate: Arc::new(Mutex::new(())),
         });
         self.receive_pair_assignment(transport, &assignment_key)?;
@@ -2930,15 +2938,15 @@ impl ProtocolClient {
             let session = session_guard
                 .as_mut()
                 .ok_or_else(|| ProtocolFailure("client is not authenticated".into()))?;
-            match decode_data_record(session, &wire, &exchange, b'1')? {
+            match decode_data_record(session, &wire, &exchange, b'1', pair_index)? {
                 ReceivedData::Fresh {
                     counter,
                     plaintext,
                     fingerprint,
                 } => {
                     ack.send_status(true, b'1', counter)?;
-                    session.receive_counter = counter;
-                    session.last_received_hash = Some(fingerprint);
+                    session.receive_counter[pair_index] = counter;
+                    session.last_received_hash[pair_index] = Some(fingerprint);
                     return Ok(Some(plaintext));
                 }
                 ReceivedData::Duplicate { counter } => {
