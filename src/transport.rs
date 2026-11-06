@@ -22,7 +22,7 @@ use socket2::{Domain, Protocol as SocketProtocol, SockRef, Socket, Type};
 
 pub const MAX_UNAUTH_PAYLOAD: usize = 65_535;
 pub const MAX_AUTH_PAYLOAD: usize = 1 << 25;
-pub const QUEUE_LIMIT: usize = 16;
+pub const QUEUE_LIMIT: usize = 32;
 pub const MAX_INPUT_BUFFER: usize = 32 * 1024 * 1024;
 pub const MAX_ACTIVE_EIDS_PER_CONNECTION: usize = 4096;
 pub const EID_TTL: Duration = Duration::from_secs(120);
@@ -34,7 +34,7 @@ const WRITE_CHUNK: usize = 64 * 1024;
 const SERVER_CONNECTION_LIMIT: usize = 200;
 const SERVER_UNAUTH_LIMIT: usize = 128;
 const PER_PEER_CONNECTION_LIMIT: usize = 64;
-const PER_PEER_RATE_LIMIT: usize = 120;
+const PER_PEER_RATE_LIMIT: usize = 300;
 const MAX_PEER_BUCKETS: usize = 4096;
 
 #[derive(Debug, Error)]
@@ -449,7 +449,7 @@ impl Connection {
             None
         };
         let needed = payload.len().saturating_add(64);
-        if state.queued_bytes.saturating_add(needed) > 128 * 1024 * 1024 {
+        if state.queued_bytes.saturating_add(needed) > 256 * 1024 * 1024 {
             return Err(TransportError::MemoryBudget);
         }
         let lease = MemoryLease::acquire(&self.global_memory, needed, self.global_limit)
@@ -646,7 +646,7 @@ impl Connection {
                     frames += 1;
                     continue;
                 }
-                if state.queued_bytes.saturating_add(payload_len + 64) > 128 * 1024 * 1024 {
+                if state.queued_bytes.saturating_add(payload_len + 64) > 256 * 1024 * 1024 {
                     eprintln!(
                         "network2: closing connection {}: receive queue memory limit exceeded (queued={} incoming={})",
                         self.id, state.queued_bytes, payload_len + 64
@@ -1606,7 +1606,7 @@ impl TransportClient {
             None,
             &stream,
             Arc::new(AtomicUsize::new(0)),
-            128 * 1024 * 1024,
+            256 * 1024 * 1024,
             magic1,
             magic2,
             false,
