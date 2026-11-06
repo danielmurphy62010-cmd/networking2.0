@@ -630,19 +630,6 @@ fn spawn_client_ack_reader(
         .map_err(|error| ProtocolFailure(format!("could not start ACK reader: {error}")))
 }
 
-fn resolve_ack_port(port: u16, requested: Option<u16>) -> PResult<u16> {
-    let selected = match requested {
-        Some(value) => value,
-        None => port
-            .checked_add(1)
-            .ok_or_else(|| ProtocolFailure("main port 65535 requires an explicit ack_port".into()))?,
-    };
-    if selected == port {
-        return Err(ProtocolFailure("ack_port must differ from the main port".into()));
-    }
-    Ok(selected)
-}
-
 struct Session {
     key: Vec<u8>,
     send_counter: u64,
@@ -927,33 +914,117 @@ impl ProtocolServer {
         Err(ProtocolFailure("secondary channel authentication failed".into()))
     }
 
-    fn run_ack_handshake(self: &Arc<Self>, temp_cid: &[u8]) {
-        if let Err(error) = self.ack_handshake(temp_cid) {
-            eprintln!("network2 secondary-channel handshake failed: {error}");
-            if let Ok(transport) = self.ack_transport() {
+    fn run_data_handshake(self: &Arc<Self>, pair_index: usize, temp_cid: &[u8]) {
+        if let Err(error) = self.data_handshake(pair_index, temp_cid) {
+            eprintln!("network2 bulk-channel handshake failed on pair {pair_index}: {error}");
+            if let Ok(transport) = self.data_transport(pair_index) {
                 transport.close_handshake(temp_cid);
             }
         }
     }
 
-    fn ack_handshake(self: &Arc<Self>, temp_cid: &[u8]) -> PResult<()> {
-        let transport = self.ack_transport()?;
+    fn data_handshake(self: &Arc<Self>, pair_index: usize, temp_cid: &[u8]) -> PResult<()> {
+        let transport = self.data_transport(pair_index)?;
         let hello = transport
             .recv_handshake(temp_cid, Some(ACK_CONNECT_TIMEOUT))?
-            .ok_or_else(|| ProtocolFailure("secondary-channel hello timed out".into()))?;
+            .ok_or_else(|| ProtocolFailure("bulk-channel hello timed out".into()))?;
+        if hello.len() < DATA_HELLO_MAGIC.len() + 16 + 8 + crypto::AES_GCM_OVERHEAD
+            || &hello[..DATA_HELLO_MAGIC.len()] != DATA_HELLO_MAGIC
+        {
+            return Err(ProtocolFailure("invalid bulk-channel hello".into()));
+        }
+
+        let key_id = &hello[DATA_HELLO_MAGIC.len()..DATA_HELLO_MAGIC.len() + 16];
+        let encrypted = &hello[DATA_HELLO_MAGIC.len() + 16..];
+        let (main_cid, control_key) = self.find_session_by_ack_key_id(key_id)?;
+        if !self.pair_is_assigned(&main_cid, pair_index) {
+            return Err(ProtocolFailure("bulk port pair is not assigned to this client".into()));
+        }
+        let hello_aad = port_handshake_aad(b"data", b"client-hello", pair_index, key_id);
+        let hello_plain = crypto::decrypt_gcm(encrypted, &control_key, Some(&hello_aad))?;
+        if hello_plain.len() != 40 || !ct_equal(&hello_plain[..8], DATA_HELLO_TAG) {
+            return Err(ProtocolFailure("bulk-channel hello proof failed".into()));
+        }
+        let client_nonce = &hello_plain[8..40];
+        let server_nonce = crypto::random_bytes(32)?;
+
+        let mut challenge_plain = Vec::with_capacity(72);
+        challenge_plain.extend_from_slice(DATA_CHALLENGE_TAG);
+        challenge_plain.extend_from_slice(client_nonce);
+        challenge_plain.extend_from_slice(&server_nonce);
+        let challenge_aad = port_handshake_aad(b"data", b"server-challenge", pair_index, key_id);
+        let challenge_encrypted =
+            crypto::encrypt_gcm(&challenge_plain, &control_key, Some(&challenge_aad))?;
+        let mut challenge = DATA_CHALLENGE_MAGIC.to_vec();
+        challenge.extend_from_slice(&challenge_encrypted);
+        transport.send_handshake(temp_cid, challenge)?;
+
+        let finish = transport
+            .recv_handshake(temp_cid, Some(ACK_CONNECT_TIMEOUT))?
+            .ok_or_else(|| ProtocolFailure("bulk-channel finish timed out".into()))?;
+        if finish.len() < DATA_FINISH_MAGIC.len() + 8 + crypto::AES_GCM_OVERHEAD
+            || &finish[..DATA_FINISH_MAGIC.len()] != DATA_FINISH_MAGIC
+        {
+            return Err(ProtocolFailure("invalid bulk-channel finish".into()));
+        }
+        let finish_aad = port_handshake_aad(b"data", b"client-finish", pair_index, key_id);
+        let finish_plain = crypto::decrypt_gcm(
+            &finish[DATA_FINISH_MAGIC.len()..],
+            &control_key,
+            Some(&finish_aad),
+        )?;
+        let mut expected_finish = Vec::with_capacity(72);
+        expected_finish.extend_from_slice(DATA_FINISH_TAG);
+        expected_finish.extend_from_slice(client_nonce);
+        expected_finish.extend_from_slice(&server_nonce);
+        if !ct_equal(&finish_plain, &expected_finish) {
+            return Err(ProtocolFailure("bulk-channel finish proof failed".into()));
+        }
+
+        let channel_key = port_channel_key(
+            &control_key, client_nonce, &server_nonce, b"data", pair_index,
+        );
+        let ready_aad = port_handshake_aad(b"data", b"server-ready", pair_index, key_id);
+        let mut ready_plain = DATA_READY_TAG.to_vec();
+        ready_plain.push(pair_index as u8);
+        let ready_encrypted = crypto::encrypt_gcm(&ready_plain, &channel_key, Some(&ready_aad))?;
+        let mut ready = DATA_READY_MAGIC.to_vec();
+        ready.extend_from_slice(&ready_encrypted);
+        transport.send_handshake(temp_cid, ready)?;
+        transport.auth_finished(temp_cid, main_cid, None)?;
+        Ok(())
+    }
+
+    fn run_ack_handshake(self: &Arc<Self>, pair_index: usize, temp_cid: &[u8]) {
+        if let Err(error) = self.ack_handshake(pair_index, temp_cid) {
+            eprintln!("network2 ACK-channel handshake failed on pair {pair_index}: {error}");
+            if let Ok(transport) = self.ack_transport(pair_index) {
+                transport.close_handshake(temp_cid);
+            }
+        }
+    }
+
+    fn ack_handshake(self: &Arc<Self>, pair_index: usize, temp_cid: &[u8]) -> PResult<()> {
+        let transport = self.ack_transport(pair_index)?;
+        let hello = transport
+            .recv_handshake(temp_cid, Some(ACK_CONNECT_TIMEOUT))?
+            .ok_or_else(|| ProtocolFailure("ACK-channel hello timed out".into()))?;
         if hello.len() < ACK_HELLO_MAGIC.len() + 16 + 8 + crypto::AES_GCM_OVERHEAD
             || &hello[..ACK_HELLO_MAGIC.len()] != ACK_HELLO_MAGIC
         {
-            return Err(ProtocolFailure("invalid secondary-channel hello".into()));
+            return Err(ProtocolFailure("invalid ACK-channel hello".into()));
         }
 
         let key_id = &hello[ACK_HELLO_MAGIC.len()..ACK_HELLO_MAGIC.len() + 16];
         let encrypted = &hello[ACK_HELLO_MAGIC.len() + 16..];
         let (main_cid, control_key) = self.find_session_by_ack_key_id(key_id)?;
-        let hello_aad = ack_handshake_aad(b"client-hello", key_id);
+        if !self.pair_is_assigned(&main_cid, pair_index) {
+            return Err(ProtocolFailure("ACK port pair is not assigned to this client".into()));
+        }
+        let hello_aad = port_handshake_aad(b"ack", b"client-hello", pair_index, key_id);
         let hello_plain = crypto::decrypt_gcm(encrypted, &control_key, Some(&hello_aad))?;
         if hello_plain.len() != 40 || !ct_equal(&hello_plain[..8], ACK_HELLO_TAG) {
-            return Err(ProtocolFailure("secondary-channel hello proof failed".into()));
+            return Err(ProtocolFailure("ACK-channel hello proof failed".into()));
         }
         let client_nonce = &hello_plain[8..40];
         let server_nonce = crypto::random_bytes(32)?;
@@ -962,7 +1033,7 @@ impl ProtocolServer {
         challenge_plain.extend_from_slice(ACK_CHALLENGE_TAG);
         challenge_plain.extend_from_slice(client_nonce);
         challenge_plain.extend_from_slice(&server_nonce);
-        let challenge_aad = ack_handshake_aad(b"server-challenge", key_id);
+        let challenge_aad = port_handshake_aad(b"ack", b"server-challenge", pair_index, key_id);
         let challenge_encrypted =
             crypto::encrypt_gcm(&challenge_plain, &control_key, Some(&challenge_aad))?;
         let mut challenge = ACK_CHALLENGE_MAGIC.to_vec();
@@ -971,13 +1042,13 @@ impl ProtocolServer {
 
         let finish = transport
             .recv_handshake(temp_cid, Some(ACK_CONNECT_TIMEOUT))?
-            .ok_or_else(|| ProtocolFailure("secondary-channel finish timed out".into()))?;
+            .ok_or_else(|| ProtocolFailure("ACK-channel finish timed out".into()))?;
         if finish.len() < ACK_FINISH_MAGIC.len() + 8 + crypto::AES_GCM_OVERHEAD
             || &finish[..ACK_FINISH_MAGIC.len()] != ACK_FINISH_MAGIC
         {
-            return Err(ProtocolFailure("invalid secondary-channel finish".into()));
+            return Err(ProtocolFailure("invalid ACK-channel finish".into()));
         }
-        let finish_aad = ack_handshake_aad(b"client-finish", key_id);
+        let finish_aad = port_handshake_aad(b"ack", b"client-finish", pair_index, key_id);
         let finish_plain =
             crypto::decrypt_gcm(&finish[ACK_FINISH_MAGIC.len()..], &control_key, Some(&finish_aad))?;
         let mut expected_finish = Vec::with_capacity(72);
@@ -985,13 +1056,15 @@ impl ProtocolServer {
         expected_finish.extend_from_slice(client_nonce);
         expected_finish.extend_from_slice(&server_nonce);
         if !ct_equal(&finish_plain, &expected_finish) {
-            return Err(ProtocolFailure("secondary-channel finish proof failed".into()));
+            return Err(ProtocolFailure("ACK-channel finish proof failed".into()));
         }
 
-        let channel_key = ack_channel_key(&control_key, client_nonce, &server_nonce);
-        let peer_cid = crypto::basic_kdf(&main_cid, b"network2-ack-transport-cid-v1", 32);
+        let channel_key = port_channel_key(
+            &control_key, client_nonce, &server_nonce, b"ack", pair_index,
+        );
+        let peer_cid = ack_peer_cid(&main_cid, pair_index);
         let peer_connection_id = transport.connection_id(temp_cid)?;
-        self.close_ack_channel(&main_cid);
+        self.close_ack_channel_for_pair(&main_cid, pair_index);
         transport.auth_finished(temp_cid, peer_cid.clone(), None)?;
 
         let channel = Arc::new(AckChannel::server(
@@ -1003,51 +1076,52 @@ impl ProtocolServer {
         self.ack_channels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(main_cid.clone(), channel.clone());
+            .insert((main_cid.clone(), pair_index), channel.clone());
         if let Err(error) =
             spawn_server_ack_reader(transport.clone(), peer_cid.clone(), channel.clone())
         {
-            self.close_ack_channel(&main_cid);
+            self.close_ack_channel_for_pair(&main_cid, pair_index);
             return Err(error);
         }
         if let Err(error) = channel.send_ready() {
-            self.close_ack_channel(&main_cid);
+            self.close_ack_channel_for_pair(&main_cid, pair_index);
             return Err(error);
         }
         Ok(())
     }
 
-    fn close_ack_channel(&self, main_cid: &[u8]) {
+    fn close_ack_channel_for_pair(&self, main_cid: &[u8], pair_index: usize) {
         let channel = self
             .ack_channels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(main_cid);
+            .remove(&(main_cid.to_vec(), pair_index));
         if let Some(channel) = channel {
             channel.close();
-            if let Ok(transport) = self.ack_transport() {
+            if let Ok(transport) = self.ack_transport(pair_index) {
                 let _ = transport.close_client(&channel.peer_cid);
             }
         }
     }
 
-    fn forget_ack_generation(&self, peer_cid: &[u8], connection_id: u64) {
+    fn close_ack_channels(&self, main_cid: &[u8]) {
+        for pair_index in 0..PORT_PAIR_COUNT {
+            self.close_ack_channel_for_pair(main_cid, pair_index);
+        }
+    }
+
+    fn forget_ack_generation(&self, pair_index: usize, peer_cid: &[u8], connection_id: u64) {
         let main_cid = {
             let channels = self.ack_channels.lock().unwrap_or_else(|e| e.into_inner());
-            channels.iter().find_map(|(main_cid, channel)| {
-                (channel.peer_cid == peer_cid && channel.peer_connection_id == connection_id)
+            channels.iter().find_map(|((main_cid, pair), channel)| {
+                (*pair == pair_index
+                    && channel.peer_cid == peer_cid
+                    && channel.peer_connection_id == connection_id)
                     .then_some(main_cid.clone())
             })
         };
         if let Some(main_cid) = main_cid {
-            if let Some(channel) = self
-                .ack_channels
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&main_cid)
-            {
-                channel.close();
-            }
+            self.close_ack_channel_for_pair(&main_cid, pair_index);
         }
     }
 
@@ -1448,6 +1522,8 @@ impl ProtocolServer {
         if cid.is_empty() || cid.len() > transport::MAX_CID_BYTES {
             return Err(ProtocolFailure("invalid client id length".into()));
         }
+        let pairs = self.allocate_pairs();
+        let assignment = encode_port_assignment(&session.key, &pairs)?;
         {
             let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             if sessions.contains_key(&cid) {
@@ -1455,11 +1531,19 @@ impl ProtocolServer {
             }
             sessions.insert(cid.clone(), Arc::new(Mutex::new(session)));
         }
-        if let Err(error) = self.transport()?.auth_finished(temp_cid, cid.clone(), None) {
-            self.sessions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&cid);
+        self.assigned_pairs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(cid.clone(), pairs);
+        let main = self.transport()?;
+        if let Err(error) = main.send_handshake(temp_cid, assignment) {
+            self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&cid);
+            self.assigned_pairs.lock().unwrap_or_else(|e| e.into_inner()).remove(&cid);
+            return Err(error.into());
+        }
+        if let Err(error) = main.auth_finished(temp_cid, cid.clone(), None) {
+            self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&cid);
+            self.assigned_pairs.lock().unwrap_or_else(|e| e.into_inner()).remove(&cid);
             return Err(error.into());
         }
         Ok(())
@@ -1568,8 +1652,10 @@ impl ProtocolServer {
             wire.extend_from_slice(&encrypted);
             wire_payload = wire;
         }
-        let ack = self.ack_channel(client_id)?;
-        let transport = self.transport()?;
+        let pair_index = self.pair_for_eid(client_id, &exchange)
+            .ok_or_else(|| ProtocolFailure("client has no assigned port pair".into()))?;
+        let ack = self.ack_channel(client_id, pair_index)?;
+        let transport = self.data_transport(pair_index)?;
         send_data_with_ack(&ack, counter, || {
             transport.send(client_id, wire_payload.clone(), Some(exchange.to_vec()))?;
             Ok(())
@@ -1598,8 +1684,10 @@ impl ProtocolServer {
             Ok(value) => value,
             Err(_) => return Ok(None),
         };
-        let ack = self.ack_channel(client_id)?;
-        let transport = self.transport()?;
+        let pair_index = self.pair_for_eid(client_id, &exchange)
+            .ok_or_else(|| ProtocolFailure("client has no assigned port pair".into()))?;
+        let ack = self.ack_channel(client_id, pair_index)?;
+        let transport = self.data_transport(pair_index)?;
         let deadline = timeout.map(|value| Instant::now() + value);
         loop {
             let remaining = deadline.map(|value| value.saturating_duration_since(Instant::now()));
@@ -1642,65 +1730,67 @@ impl ProtocolServer {
     }
 
     pub fn is_authed(&self, cid: &[u8]) -> bool {
-        let session_exists = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(cid);
+        let session_exists = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).contains_key(cid);
+        let Some(pairs) = self.assigned_pairs(cid) else { return false };
         session_exists
             && self.transport().is_ok_and(|transport| transport.is_authed(cid))
-            && self
-                .ack_channels
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(cid)
-                .is_some_and(|channel| !channel.closed.load(Ordering::Acquire))
+            && pairs.iter().all(|pair| {
+                self.data_transport(*pair).is_ok_and(|transport| transport.is_authed(cid))
+                    && self.ack_channels.lock().unwrap_or_else(|e| e.into_inner())
+                        .get(&(cid.to_vec(), *pair))
+                        .is_some_and(|channel| !channel.closed.load(Ordering::Acquire))
+            })
     }
 
     pub fn set_backpressure(&self, cid: &[u8], enabled: bool) -> PResult<()> {
-        self.transport()?.set_backpressure(cid, enabled)?;
+        let pairs = self.assigned_pairs(cid)
+            .ok_or_else(|| ProtocolFailure("client has no assigned port pairs".into()))?;
+        for pair in pairs {
+            self.data_transport(pair)?.set_backpressure(cid, enabled)?;
+        }
         Ok(())
     }
 
     pub fn close_client(&self, cid: &[u8], close_socket: bool) -> PResult<()> {
+        let pairs = self.assigned_pairs(cid).unwrap_or([0; PORT_PAIRS_PER_CLIENT]);
         if close_socket {
             self.transport()?.close_client(cid)?;
         }
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(cid);
-        self.close_ack_channel(cid);
+        self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(cid);
+        self.assigned_pairs.lock().unwrap_or_else(|e| e.into_inner()).remove(cid);
+        for pair in pairs {
+            if close_socket {
+                if let Ok(data) = self.data_transport(pair) {
+                    let _ = data.close_client(cid);
+                }
+            }
+            self.close_ack_channel_for_pair(cid, pair);
+        }
         if close_socket {
-            self.pending_bootstrap_totp
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(cid);
+            self.pending_bootstrap_totp.lock().unwrap_or_else(|e| e.into_inner()).remove(cid);
         }
         Ok(())
     }
 
     fn forget_client_generation(&self, cid: &[u8], connection_id: u64) {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        let should_remove = sessions
-            .get(cid)
-            .is_some_and(|session| {
-                session
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .connection_id
-                    == connection_id
-            });
+        let should_remove = sessions.get(cid).is_some_and(|session| {
+            session.lock().unwrap_or_else(|e| e.into_inner()).connection_id == connection_id
+        });
         if should_remove {
             sessions.remove(cid);
-            self.pending_bootstrap_totp
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(cid);
+            self.pending_bootstrap_totp.lock().unwrap_or_else(|e| e.into_inner()).remove(cid);
         }
         drop(sessions);
         if should_remove {
-            self.close_ack_channel(cid);
+            let pairs = self.assigned_pairs.lock().unwrap_or_else(|e| e.into_inner())
+                .remove(cid).unwrap_or([0; PORT_PAIRS_PER_CLIENT]);
+            for pair in pairs {
+                if let Ok(data) = self.data_transport(pair) {
+                    let _ = data.close_client(cid);
+                }
+                self.close_ack_channel_for_pair(cid, pair);
+            }
         }
     }
 
@@ -1708,12 +1798,7 @@ impl ProtocolServer {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let Some(transport) = self
-            .transport
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+        if let Some(transport) = self.transport.lock().unwrap_or_else(|e| e.into_inner()).take() {
             transport.stop();
         }
         let channels = {
@@ -1723,18 +1808,20 @@ impl ProtocolServer {
         for channel in channels {
             channel.close();
         }
-        if let Some(transport) = self
-            .ack_transport
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+        let ack_transports = std::mem::take(
+            &mut *self.ack_transports.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        for transport in ack_transports {
             transport.stop();
         }
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let data_transports = std::mem::take(
+            &mut *self.data_transports.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        for transport in data_transports {
+            transport.stop();
+        }
+        self.assigned_pairs.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.sessions.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     fn require_admin(&self, cid: &[u8]) -> PResult<Arc<Mutex<Session>>> {
@@ -1988,7 +2075,8 @@ impl ProtocolServer {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&target_cid);
-        self.close_ack_channel(&target_cid);
+        self.assigned_pairs.lock().unwrap_or_else(|e| e.into_inner()).remove(&target_cid);
+        self.close_ack_channels(&target_cid);
         self.send_json_reply(
             cid,
             eid,
