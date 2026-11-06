@@ -1427,7 +1427,7 @@ impl ProtocolServer {
                 admin: false,
                 username: Some(fid),
                 connection_id,
-                last_received_hash: [None; PORT_PAIRS_PER_CLIENT],
+                last_received_hash: [None; PORT_PAIR_COUNT],
                 send_gate: Arc::new(Mutex::new(())),
             },
         )
@@ -2815,8 +2815,8 @@ impl ProtocolClient {
         }
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(Session {
             key: tss.clone(),
-            send_counter: [3; PORT_PAIRS_PER_CLIENT],
-            receive_counter: [2; PORT_PAIRS_PER_CLIENT],
+            send_counter: [3; PORT_PAIR_COUNT],
+            receive_counter: [2; PORT_PAIR_COUNT],
             admin: true,
             username: None,
             connection_id: 1,
@@ -2852,12 +2852,12 @@ impl ProtocolClient {
         let assignment_key = key.clone();
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(Session {
             key,
-            send_counter: [send_counter; PORT_PAIRS_PER_CLIENT],
-            receive_counter: [receive_counter; PORT_PAIRS_PER_CLIENT],
+            send_counter: [send_counter; PORT_PAIR_COUNT],
+            receive_counter: [receive_counter; PORT_PAIR_COUNT],
             admin: false,
             username: None,
             connection_id: 1,
-            last_received_hash: [None; PORT_PAIRS_PER_CLIENT],
+            last_received_hash: [None; PORT_PAIR_COUNT],
             send_gate: Arc::new(Mutex::new(())),
         });
         self.receive_pair_assignment(transport, &assignment_key)?;
