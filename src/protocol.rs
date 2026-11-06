@@ -1759,19 +1759,20 @@ impl ProtocolServer {
     }
 
     pub fn close_client(&self, cid: &[u8], close_socket: bool) -> PResult<()> {
-        let pairs = self.assigned_pairs(cid).unwrap_or([0; PORT_PAIRS_PER_CLIENT]);
+        let pairs = self.assigned_pairs.lock().unwrap_or_else(|e| e.into_inner()).remove(cid);
         if close_socket {
             self.transport()?.close_client(cid)?;
         }
         self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(cid);
-        self.assigned_pairs.lock().unwrap_or_else(|e| e.into_inner()).remove(cid);
-        for pair in pairs {
-            if close_socket {
+        // A removed session must never leave authenticated bulk sockets behind,
+        // even when the caller intentionally keeps the base control socket open.
+        if let Some(pairs) = pairs {
+            for pair in pairs {
                 if let Ok(data) = self.data_transport(pair) {
                     let _ = data.close_client(cid);
                 }
+                self.close_ack_channel_for_pair(cid, pair);
             }
-            self.close_ack_channel_for_pair(cid, pair);
         }
         if close_socket {
             self.pending_bootstrap_totp.lock().unwrap_or_else(|e| e.into_inner()).remove(cid);
@@ -2077,13 +2078,7 @@ impl ProtocolServer {
         self.require_admin(cid)?;
         let (target_cid, username) = self.resolve_target(target)?;
         let target_cid = target_cid.ok_or_else(|| ProtocolFailure("target is not connected".into()))?;
-        self.transport()?.close_client(&target_cid)?;
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&target_cid);
-        self.assigned_pairs.lock().unwrap_or_else(|e| e.into_inner()).remove(&target_cid);
-        self.close_ack_channels(&target_cid);
+        self.close_client(&target_cid, true)?;
         self.send_json_reply(
             cid,
             eid,
@@ -2522,11 +2517,6 @@ impl ProtocolClient {
             .unwrap_or_else(|e| e.into_inner())
             .insert(pair_index, channel);
         Ok(())
-    }
-
-    fn ack_channel_for_eid(&self, eid: &[u8; 8]) -> PResult<Arc<AckChannel>> {
-        let pair_index = self.pair_for_eid(eid)?;
-        self.ack_channel(pair_index)
     }
 
     pub fn set_python_self(&self, object: Py<PyAny>) {
