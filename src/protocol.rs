@@ -542,7 +542,7 @@ fn decode_data_record(
     direction: u8,
     pair_index: usize,
 ) -> PResult<ReceivedData> {
-    if pair_index >= PORT_PAIRS_PER_CLIENT {
+    if pair_index >= PORT_PAIR_COUNT {
         return Err(ProtocolFailure("invalid EID-selected port pair index".into()));
     }
     if wire.len() < 8 {
@@ -641,9 +641,9 @@ struct Session {
     key: Vec<u8>,
     // Counters are independent per EID-selected port pair. TCP ordering is
     // guaranteed within a pair, but not across the four parallel sockets.
-    send_counter: [u64; PORT_PAIRS_PER_CLIENT],
-    receive_counter: [u64; PORT_PAIRS_PER_CLIENT],
-    last_received_hash: [Option<[u8; 32]>; PORT_PAIRS_PER_CLIENT],
+    send_counter: [u64; PORT_PAIR_COUNT],
+    receive_counter: [u64; PORT_PAIR_COUNT],
+    last_received_hash: [Option<[u8; 32]>; PORT_PAIR_COUNT],
     send_gate: Arc<Mutex<()>>,
     admin: bool,
     username: Option<String>,
@@ -1288,12 +1288,12 @@ impl ProtocolServer {
             cid,
             Session {
                 key,
-                send_counter: [1; PORT_PAIRS_PER_CLIENT],
-                receive_counter: [0; PORT_PAIRS_PER_CLIENT],
+                send_counter: [1; PORT_PAIR_COUNT],
+                receive_counter: [0; PORT_PAIR_COUNT],
                 admin: false,
                 username: Some(username.to_string()),
                 connection_id,
-                last_received_hash: [None; PORT_PAIRS_PER_CLIENT],
+                last_received_hash: [None; PORT_PAIR_COUNT],
                 send_gate: Arc::new(Mutex::new(())),
             },
         )
@@ -1422,8 +1422,8 @@ impl ProtocolServer {
             cid,
             Session {
                 key,
-                send_counter: [3; PORT_PAIRS_PER_CLIENT],
-                receive_counter: [2; PORT_PAIRS_PER_CLIENT],
+                send_counter: [3; PORT_PAIR_COUNT],
+                receive_counter: [2; PORT_PAIR_COUNT],
                 admin: false,
                 username: Some(fid),
                 connection_id,
@@ -1511,12 +1511,12 @@ impl ProtocolServer {
             cid,
             Session {
                 key: tss,
-                send_counter: 3,
-                receive_counter: 2,
+                send_counter: [3; PORT_PAIR_COUNT],
+                receive_counter: [2; PORT_PAIR_COUNT],
                 admin: true,
                 username: None,
                 connection_id,
-                last_received_hash: None,
+                last_received_hash: [None; PORT_PAIR_COUNT],
                 send_gate: Arc::new(Mutex::new(())),
             },
         )
@@ -1636,18 +1636,18 @@ impl ProtocolServer {
                 .clone()
         };
         let _send_guard = send_gate.lock().unwrap_or_else(|e| e.into_inner());
-        let exchange: [u8; 8];
+        let exchange: [u8; 8] = match eid {
+            Some(value) => exact_eid(value)?,
+            None => crypto::random_bytes(8)?.try_into().expect("8 random bytes"),
+        };
+        let pair_index = self.pair_for_eid(client_id, &exchange)
+            .ok_or_else(|| ProtocolFailure("client has no assigned port pair".into()))?;
         let counter: u64;
         let wire_payload: Vec<u8>;
         {
             let mut session = session_arc.lock().unwrap_or_else(|e| e.into_inner());
-            exchange = match eid {
-                Some(value) => exact_eid(value)?,
-                None => crypto::random_bytes(8)?.try_into().expect("8 random bytes"),
-            };
-            counter = session.send_counter;
-            session.send_counter = session
-                .send_counter
+            counter = session.send_counter[pair_index];
+            session.send_counter[pair_index] = session.send_counter[pair_index]
                 .checked_add(1)
                 .ok_or_else(|| ProtocolFailure("send counter exhausted".into()))?;
             let counter_bytes = counter.to_be_bytes();
@@ -1661,8 +1661,6 @@ impl ProtocolServer {
             wire.extend_from_slice(&encrypted);
             wire_payload = wire;
         }
-        let pair_index = self.pair_for_eid(client_id, &exchange)
-            .ok_or_else(|| ProtocolFailure("client has no assigned port pair".into()))?;
         let ack = self.ack_channel(client_id, pair_index)?;
         let transport = self.data_transport(pair_index)?;
         send_data_with_ack(&ack, counter, || {
@@ -2822,7 +2820,7 @@ impl ProtocolClient {
             admin: true,
             username: None,
             connection_id: 1,
-            last_received_hash: None,
+            last_received_hash: [None; PORT_PAIR_COUNT],
             send_gate: Arc::new(Mutex::new(())),
         });
         self.receive_pair_assignment(transport, &tss)?;
@@ -2877,7 +2875,11 @@ impl ProtocolClient {
                 .clone()
         };
         let _send_guard = send_gate.lock().unwrap_or_else(|e| e.into_inner());
-        let exchange: [u8; 8];
+        let exchange: [u8; 8] = match eid {
+            Some(value) => exact_eid(value)?,
+            None => crypto::random_bytes(8)?.try_into().expect("8 random bytes"),
+        };
+        let pair_index = self.pair_for_eid(&exchange)?;
         let counter: u64;
         let wire_payload: Vec<u8>;
         {
@@ -2885,13 +2887,8 @@ impl ProtocolClient {
             let session = session_guard
                 .as_mut()
                 .ok_or_else(|| ProtocolFailure("client is not authenticated".into()))?;
-            exchange = match eid {
-                Some(value) => exact_eid(value)?,
-                None => crypto::random_bytes(8)?.try_into().expect("8 random bytes"),
-            };
-            counter = session.send_counter;
-            session.send_counter = session
-                .send_counter
+            counter = session.send_counter[pair_index];
+            session.send_counter[pair_index] = session.send_counter[pair_index]
                 .checked_add(1)
                 .ok_or_else(|| ProtocolFailure("send counter exhausted".into()))?;
             let counter_bytes = counter.to_be_bytes();
@@ -2905,7 +2902,6 @@ impl ProtocolClient {
             wire.extend_from_slice(&encrypted);
             wire_payload = wire;
         }
-        let pair_index = self.pair_for_eid(&exchange)?;
         let ack = self.ack_channel(pair_index)?;
         let transport = self.data_transport(pair_index)?;
         send_data_with_ack(&ack, counter, || {
