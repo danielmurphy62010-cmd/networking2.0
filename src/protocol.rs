@@ -10,7 +10,7 @@ use std::{
     io::{self, Write},
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -97,6 +97,20 @@ const ACK_COPIES: usize = 3;
 const ACK_RETRY_BASE: Duration = Duration::from_millis(250);
 const ACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+// N is the handshake port. Ten bulk/ACK pairs occupy N+1 through N+20.
+const PORT_PAIR_COUNT: usize = 10;
+const PORT_PAIRS_PER_CLIENT: usize = 4;
+const PORT_ASSIGNMENT_MAGIC: &[u8; 8] = b"N2PAIR01";
+const PORT_ASSIGNMENT_AAD: &[u8] = b"network2-port-assignment-v1";
+
+const DATA_HELLO_MAGIC: &[u8; 8] = b"N2DATAH1";
+const DATA_CHALLENGE_MAGIC: &[u8; 8] = b"N2DATAC1";
+const DATA_FINISH_MAGIC: &[u8; 8] = b"N2DATAF1";
+const DATA_HELLO_TAG: &[u8; 8] = b"DHELLO1!";
+const DATA_CHALLENGE_TAG: &[u8; 8] = b"DCHALN1!";
+const DATA_FINISH_TAG: &[u8; 8] = b"DFINISH!";
+const DATA_READY_TAG: &[u8; 8] = b"DREADY1!";
+
 fn ack_control_key(session_key: &[u8]) -> Vec<u8> {
     crypto::basic_kdf(session_key, b"network2-ack-control-key-v1", 32)
 }
@@ -105,20 +119,97 @@ fn ack_control_key_id(control_key: &[u8]) -> Vec<u8> {
     crypto::basic_kdf(control_key, b"network2-ack-control-key-id-v1", 16)
 }
 
-fn ack_channel_key(control_key: &[u8], client_nonce: &[u8], server_nonce: &[u8]) -> Vec<u8> {
-    let mut context = b"network2-ack-channel-v1".to_vec();
+fn port_channel_key(
+    control_key: &[u8],
+    client_nonce: &[u8],
+    server_nonce: &[u8],
+    role: &[u8],
+    pair_index: usize,
+) -> Vec<u8> {
+    let mut context = b"network2-port-channel-v1".to_vec();
+    context.push(0);
+    context.extend_from_slice(role);
+    context.push(pair_index as u8);
     context.extend_from_slice(client_nonce);
     context.extend_from_slice(server_nonce);
     crypto::basic_kdf(control_key, &context, 32)
 }
 
-fn ack_handshake_aad(label: &[u8], key_id: &[u8]) -> Vec<u8> {
-    let mut aad = b"network2-ack-bind-v1".to_vec();
+fn port_handshake_aad(
+    role: &[u8],
+    label: &[u8],
+    pair_index: usize,
+    key_id: &[u8],
+) -> Vec<u8> {
+    let mut aad = b"network2-port-handshake-v1".to_vec();
     aad.push(0);
+    aad.extend_from_slice(role);
+    aad.push(pair_index as u8);
     aad.extend_from_slice(label);
     aad.push(0);
     aad.extend_from_slice(key_id);
     aad
+}
+
+fn encode_port_assignment(key: &[u8], pairs: &[usize; PORT_PAIRS_PER_CLIENT]) -> PResult<Vec<u8>> {
+    let mut plaintext = Vec::with_capacity(2 + PORT_PAIRS_PER_CLIENT);
+    plaintext.push(1); // assignment format version
+    plaintext.push(PORT_PAIRS_PER_CLIENT as u8);
+    for pair in pairs {
+        if *pair >= PORT_PAIR_COUNT {
+            return Err(ProtocolFailure("invalid port-pair assignment".into()));
+        }
+        plaintext.push(*pair as u8);
+    }
+    let encrypted = crypto::encrypt_gcm(&plaintext, key, Some(PORT_ASSIGNMENT_AAD))?;
+    let mut frame = PORT_ASSIGNMENT_MAGIC.to_vec();
+    frame.extend_from_slice(&encrypted);
+    Ok(frame)
+}
+
+fn decode_port_assignment(frame: &[u8], key: &[u8]) -> PResult<[usize; PORT_PAIRS_PER_CLIENT]> {
+    if frame.len() < PORT_ASSIGNMENT_MAGIC.len() + crypto::AES_GCM_OVERHEAD
+        || &frame[..PORT_ASSIGNMENT_MAGIC.len()] != PORT_ASSIGNMENT_MAGIC
+    {
+        return Err(ProtocolFailure("invalid port-pair assignment frame".into()));
+    }
+    let plaintext = crypto::decrypt_gcm(
+        &frame[PORT_ASSIGNMENT_MAGIC.len()..],
+        key,
+        Some(PORT_ASSIGNMENT_AAD),
+    )?;
+    if plaintext.len() != 2 + PORT_PAIRS_PER_CLIENT
+        || plaintext[0] != 1
+        || plaintext[1] as usize != PORT_PAIRS_PER_CLIENT
+    {
+        return Err(ProtocolFailure("invalid port-pair assignment payload".into()));
+    }
+    let mut pairs = [0usize; PORT_PAIRS_PER_CLIENT];
+    let mut seen = [false; PORT_PAIR_COUNT];
+    for (slot, value) in pairs.iter_mut().zip(plaintext[2..].iter()) {
+        let pair = *value as usize;
+        if pair >= PORT_PAIR_COUNT || seen[pair] {
+            return Err(ProtocolFailure("invalid or duplicate assigned port pair".into()));
+        }
+        seen[pair] = true;
+        *slot = pair;
+    }
+    Ok(pairs)
+}
+
+fn eid_pair_slot(eid: &[u8; 8]) -> usize {
+    (eid.iter().fold(0u8, |folded, byte| folded ^ byte) as usize)
+        % PORT_PAIRS_PER_CLIENT
+}
+
+fn selected_pair(eid: &[u8; 8], assigned: &[usize; PORT_PAIRS_PER_CLIENT]) -> usize {
+    assigned[eid_pair_slot(eid)]
+}
+
+fn ack_peer_cid(main_cid: &[u8], pair_index: usize) -> Vec<u8> {
+    let mut context = b"network2-ack-transport-cid-v1".to_vec();
+    context.push(pair_index as u8);
+    crypto::basic_kdf(main_cid, &context, 32)
 }
 
 fn ack_record_aad(direction: u8, counter: u64) -> Vec<u8> {
@@ -581,9 +672,13 @@ struct ClientIdentity {
 }
 
 pub struct ProtocolServer {
+    // Port N is retained only for the authenticated handshake/control lifetime.
     transport: Mutex<Option<transport::TransportServer>>,
-    ack_transport: Mutex<Option<transport::TransportServer>>,
-    ack_channels: Mutex<HashMap<Vec<u8>, Arc<AckChannel>>>,
+    data_transports: Mutex<Vec<transport::TransportServer>>,
+    ack_transports: Mutex<Vec<transport::TransportServer>>,
+    assigned_pairs: Mutex<HashMap<Vec<u8>, [usize; PORT_PAIRS_PER_CLIENT]>>,
+    next_pair: AtomicUsize,
+    ack_channels: Mutex<HashMap<(Vec<u8>, usize), Arc<AckChannel>>>,
     signing_private: Vec<u8>,
     signing_public: Vec<u8>,
     at_rest_key: Vec<u8>,
@@ -607,16 +702,23 @@ impl ProtocolServer {
         new_totp: bool,
         callback: Option<Py<PyAny>>,
         simult_exchanges: usize,
-        requested_ack_port: Option<u16>,
+        _requested_ack_port: Option<u16>,
     ) -> PResult<Arc<Self>> {
         if !(1..=64).contains(&simult_exchanges) {
             return Err(ProtocolFailure("simult_exchanges must be between 1 and 64".into()));
         }
-        let ack_port = resolve_ack_port(port, requested_ack_port)?;
+        if port == 0 || port.checked_add((PORT_PAIR_COUNT * 2) as u16).is_none() {
+            return Err(ProtocolFailure(
+                "base port must be between 1 and 65515 so all 21 ports fit".into(),
+            ));
+        }
         let storage = initialize_server_storage(&password, new_totp)?;
         let server = Arc::new(Self {
             transport: Mutex::new(None),
-            ack_transport: Mutex::new(None),
+            data_transports: Mutex::new(Vec::with_capacity(PORT_PAIR_COUNT)),
+            ack_transports: Mutex::new(Vec::with_capacity(PORT_PAIR_COUNT)),
+            assigned_pairs: Mutex::new(HashMap::new()),
+            next_pair: AtomicUsize::new(0),
             ack_channels: Mutex::new(HashMap::new()),
             signing_private: storage.signing_private,
             signing_public: storage.signing_public,
@@ -632,18 +734,16 @@ impl ProtocolServer {
             python_self: Mutex::new(None),
             closed: AtomicBool::new(false),
         });
+
         let weak = Arc::downgrade(&server);
         let handshake = Arc::new(move |temp: Vec<u8>| {
             if let Some(server) = weak.upgrade() {
                 server.run_handshake(&temp);
             }
         });
-        let weak = Arc::downgrade(&server);
-        let exchange = Arc::new(move |cid: Vec<u8>, eid: [u8; 8]| {
-            if let Some(server) = weak.upgrade() {
-                server.dispatch_exchange(cid, eid);
-            }
-        });
+        // Port N is the handshake/control channel; exchanges are only accepted
+        // on the assigned bulk ports below.
+        let exchange = Arc::new(|_cid: Vec<u8>, _eid: [u8; 8]| {});
         let weak = Arc::downgrade(&server);
         let disconnected = Arc::new(move |cid: Vec<u8>, connection_id: u64| {
             if let Some(server) = weak.upgrade() {
@@ -653,43 +753,91 @@ impl ProtocolServer {
         let transport = transport::TransportServer::new(
             host.clone(),
             port,
-            1, // The legacy L3 wrapper fixes handshake concurrency at one.
+            1,
             simult_exchanges,
             handshake,
             exchange,
             disconnected,
         )?;
 
-        let weak = Arc::downgrade(&server);
-        let ack_handshake = Arc::new(move |temp: Vec<u8>| {
-            if let Some(server) = weak.upgrade() {
-                server.run_ack_handshake(&temp);
-            }
-        });
-        let ack_exchange = Arc::new(|_cid: Vec<u8>, _eid: [u8; 8]| {});
-        let weak = Arc::downgrade(&server);
-        let ack_disconnected = Arc::new(move |cid: Vec<u8>, connection_id: u64| {
-            if let Some(server) = weak.upgrade() {
-                server.forget_ack_generation(&cid, connection_id);
-            }
-        });
-        let ack_transport = transport::TransportServer::new(
-            host,
-            ack_port,
-            1,
-            simult_exchanges,
-            ack_handshake,
-            ack_exchange,
-            ack_disconnected,
-        )?;
+        let mut data_transports = Vec::with_capacity(PORT_PAIR_COUNT);
+        let mut ack_transports = Vec::with_capacity(PORT_PAIR_COUNT);
+        for pair_index in 0..PORT_PAIR_COUNT {
+            let data_port = port + 1 + (pair_index as u16 * 2);
+            let ack_port = data_port + 1;
+
+            let weak = Arc::downgrade(&server);
+            let data_handshake = Arc::new(move |temp: Vec<u8>| {
+                if let Some(server) = weak.upgrade() {
+                    server.run_data_handshake(pair_index, &temp);
+                }
+            });
+            let weak = Arc::downgrade(&server);
+            let data_exchange = Arc::new(move |cid: Vec<u8>, eid: [u8; 8]| {
+                if let Some(server) = weak.upgrade() {
+                    if server.pair_for_eid(&cid, &eid) == Some(pair_index) {
+                        server.dispatch_exchange(cid, eid);
+                    } else if let Ok(transport) = server.data_transport(pair_index) {
+                        let _ = transport.close_client(&cid);
+                    }
+                }
+            });
+            let data_disconnected = Arc::new(|_cid: Vec<u8>, _connection_id: u64| {});
+            data_transports.push(transport::TransportServer::new(
+                host.clone(),
+                data_port,
+                1,
+                simult_exchanges,
+                data_handshake,
+                data_exchange,
+                data_disconnected,
+            )?);
+
+            let weak = Arc::downgrade(&server);
+            let ack_handshake = Arc::new(move |temp: Vec<u8>| {
+                if let Some(server) = weak.upgrade() {
+                    server.run_ack_handshake(pair_index, &temp);
+                }
+            });
+            let ack_exchange = Arc::new(|_cid: Vec<u8>, _eid: [u8; 8]| {});
+            let weak = Arc::downgrade(&server);
+            let ack_disconnected = Arc::new(move |cid: Vec<u8>, connection_id: u64| {
+                if let Some(server) = weak.upgrade() {
+                    server.forget_ack_generation(pair_index, &cid, connection_id);
+                }
+            });
+            ack_transports.push(transport::TransportServer::new(
+                host.clone(),
+                ack_port,
+                1,
+                simult_exchanges,
+                ack_handshake,
+                ack_exchange,
+                ack_disconnected,
+            )?);
+        }
 
         *server.transport.lock().unwrap_or_else(|e| e.into_inner()) = Some(transport.clone());
-        *server.ack_transport.lock().unwrap_or_else(|e| e.into_inner()) = Some(ack_transport.clone());
-        transport.start()?;
-        if let Err(error) = ack_transport.start() {
-            transport.stop();
+        *server.data_transports.lock().unwrap_or_else(|e| e.into_inner()) = data_transports.clone();
+        *server.ack_transports.lock().unwrap_or_else(|e| e.into_inner()) = ack_transports.clone();
+
+        let mut started = Vec::with_capacity(1 + PORT_PAIR_COUNT * 2);
+        if let Err(error) = transport.start() {
             return Err(error.into());
         }
+        started.push(transport);
+        for pair_index in 0..PORT_PAIR_COUNT {
+            for listener in [&data_transports[pair_index], &ack_transports[pair_index]] {
+                if let Err(error) = listener.start() {
+                    for running in started {
+                        running.stop();
+                    }
+                    return Err(error.into());
+                }
+                started.push(listener.clone());
+            }
+        }
+
         print_server_identity(&server.signing_public);
         Ok(server)
     }
@@ -717,22 +865,53 @@ impl ProtocolServer {
             .ok_or_else(|| ProtocolFailure("server transport is not running".into()))
     }
 
-    fn ack_transport(&self) -> PResult<transport::TransportServer> {
-        self.ack_transport
+    fn data_transport(&self, pair_index: usize) -> PResult<transport::TransportServer> {
+        self.data_transports
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
+            .get(pair_index)
             .cloned()
-            .ok_or_else(|| ProtocolFailure("ACK transport is not running".into()))
+            .ok_or_else(|| ProtocolFailure("bulk transport pair is unavailable".into()))
     }
 
-    fn ack_channel(&self, cid: &[u8]) -> PResult<Arc<AckChannel>> {
+    fn ack_transport(&self, pair_index: usize) -> PResult<transport::TransportServer> {
+        self.ack_transports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(pair_index)
+            .cloned()
+            .ok_or_else(|| ProtocolFailure("ACK transport pair is unavailable".into()))
+    }
+
+    fn ack_channel(&self, cid: &[u8], pair_index: usize) -> PResult<Arc<AckChannel>> {
         self.ack_channels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(cid)
+            .get(&(cid.to_vec(), pair_index))
             .cloned()
-            .ok_or_else(|| ProtocolFailure("secondary ACK channel is not connected".into()))
+            .ok_or_else(|| ProtocolFailure("ACK channel for the selected port pair is not connected".into()))
+    }
+
+    fn assigned_pairs(&self, cid: &[u8]) -> Option<[usize; PORT_PAIRS_PER_CLIENT]> {
+        self.assigned_pairs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(cid)
+            .copied()
+    }
+
+    fn pair_for_eid(&self, cid: &[u8], eid: &[u8; 8]) -> Option<usize> {
+        self.assigned_pairs(cid).map(|pairs| selected_pair(eid, &pairs))
+    }
+
+    fn pair_is_assigned(&self, cid: &[u8], pair_index: usize) -> bool {
+        self.assigned_pairs(cid)
+            .is_some_and(|pairs| pairs.contains(&pair_index))
+    }
+
+    fn allocate_pairs(&self) -> [usize; PORT_PAIRS_PER_CLIENT] {
+        let start = self.next_pair.fetch_add(1, Ordering::Relaxed) % PORT_PAIR_COUNT;
+        std::array::from_fn(|slot| (start + slot) % PORT_PAIR_COUNT)
     }
 
     fn find_session_by_ack_key_id(&self, key_id: &[u8]) -> PResult<(Vec<u8>, Vec<u8>)> {
