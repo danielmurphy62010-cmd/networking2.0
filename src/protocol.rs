@@ -199,7 +199,7 @@ fn decode_port_assignment(frame: &[u8], key: &[u8]) -> PResult<[usize; PORT_PAIR
 }
 
 fn eid_pair_slot(eid: &[u8; 8]) -> usize {
-    (eid.iter().fold(0u8, |folded, byte| folded ^ byte) as usize)
+    (eid.iter().fold(0u8, |folded, byte| folded ^ *byte) as usize)
         % PORT_PAIRS_PER_CLIENT
 }
 
@@ -830,7 +830,7 @@ impl ProtocolServer {
                     }
                     return Err(error.into());
                 }
-                started.push(listener.clone());
+                started.push((*listener).clone());
             }
         }
 
