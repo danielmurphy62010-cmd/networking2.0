@@ -51,7 +51,7 @@ struct PyTCPServer {
 #[pymethods]
 impl PyTCPServer {
     #[new]
-    #[pyo3(signature = (host, port, password, newTOTP=false, on_exchange=None, simult_exchanges=4))]
+    #[pyo3(signature = (host, port, password, newTOTP=false, on_exchange=None, simult_exchanges=4, ack_port=None))]
     #[allow(non_snake_case)]
     fn new(
         py: Python<'_>,
@@ -61,6 +61,7 @@ impl PyTCPServer {
         newTOTP: bool,
         on_exchange: Option<Py<PyAny>>,
         simult_exchanges: usize,
+        ack_port: Option<u16>,
     ) -> PyResult<Py<Self>> {
         let inner = py
             .detach(move || {
@@ -71,6 +72,7 @@ impl PyTCPServer {
                     newTOTP,
                     on_exchange,
                     simult_exchanges,
+                    ack_port,
                 )
             })
             .map_err(protocol_error)?;
@@ -94,6 +96,7 @@ impl PyTCPServer {
     #[pyo3(signature = (payload, eid=None, client_id=None))]
     fn send(
         &self,
+        py: Python<'_>,
         payload: &[u8],
         eid: Option<&[u8]>,
         client_id: Option<&[u8]>,
@@ -102,11 +105,14 @@ impl PyTCPServer {
         if eid.is_some_and(|value| value.len() != 8) {
             return Err(PyValueError::new_err("eid must be exactly 8 bytes"));
         }
-        let result = self
-            .inner
-            .send(payload, eid, client_id)
+        let inner = self.inner.clone();
+        let payload = payload.to_vec();
+        let exchange = eid.map(|value| value.to_vec());
+        let client_id = client_id.to_vec();
+        let result = py
+            .detach(move || inner.send(&payload, exchange.as_deref(), &client_id))
             .map_err(protocol_error)?;
-        Python::attach(|py| Ok(PyBytes::new(py, &result).unbind()))
+        Ok(PyBytes::new(py, &result).unbind())
     }
 
     #[pyo3(signature = (client_id, eid, timeout=10.0))]
@@ -289,7 +295,7 @@ struct PyTCPClient {
 #[pymethods]
 impl PyTCPClient {
     #[new]
-    #[pyo3(signature = (host, port, password, admin_auth_code=None, on_exchange=None, simult_exchanges=4))]
+    #[pyo3(signature = (host, port, password, admin_auth_code=None, on_exchange=None, simult_exchanges=4, ack_port=None))]
     fn new(
         py: Python<'_>,
         host: String,
@@ -298,6 +304,7 @@ impl PyTCPClient {
         admin_auth_code: Option<String>,
         on_exchange: Option<Py<PyAny>>,
         simult_exchanges: usize,
+        ack_port: Option<u16>,
     ) -> PyResult<Py<Self>> {
         let inner = py
             .detach(move || {
@@ -308,6 +315,7 @@ impl PyTCPClient {
                     admin_auth_code,
                     on_exchange,
                     simult_exchanges,
+                    ack_port,
                 )
             })
             .map_err(protocol_error)?;

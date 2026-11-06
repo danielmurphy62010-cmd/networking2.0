@@ -83,10 +83,481 @@ impl From<io::Error> for ProtocolFailure {
 
 pub type PResult<T> = Result<T, ProtocolFailure>;
 
+
+const ACK_EID: [u8; 8] = *b"N2ACK001";
+const ACK_HELLO_MAGIC: &[u8; 8] = b"N2ACKH01";
+const ACK_CHALLENGE_MAGIC: &[u8; 8] = b"N2ACKC01";
+const ACK_FINISH_MAGIC: &[u8; 8] = b"N2ACKF01";
+const ACK_HELLO_TAG: &[u8; 8] = b"HELLO1!!";
+const ACK_CHALLENGE_TAG: &[u8; 8] = b"CHALNG1!";
+const ACK_FINISH_TAG: &[u8; 8] = b"FINISH1!";
+const ACK_READY_TAG: &[u8; 8] = b"READY1!!";
+const MAX_DATA_RETRIES: usize = 10;
+const ACK_COPIES: usize = 3;
+const ACK_RETRY_BASE: Duration = Duration::from_millis(250);
+const ACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn ack_control_key(session_key: &[u8]) -> Vec<u8> {
+    crypto::basic_kdf(session_key, b"network2-ack-control-key-v1", 32)
+}
+
+fn ack_control_key_id(control_key: &[u8]) -> Vec<u8> {
+    crypto::basic_kdf(control_key, b"network2-ack-control-key-id-v1", 16)
+}
+
+fn ack_channel_key(control_key: &[u8], client_nonce: &[u8], server_nonce: &[u8]) -> Vec<u8> {
+    let mut context = b"network2-ack-channel-v1".to_vec();
+    context.extend_from_slice(client_nonce);
+    context.extend_from_slice(server_nonce);
+    crypto::basic_kdf(control_key, &context, 32)
+}
+
+fn ack_handshake_aad(label: &[u8], key_id: &[u8]) -> Vec<u8> {
+    let mut aad = b"network2-ack-bind-v1".to_vec();
+    aad.push(0);
+    aad.extend_from_slice(label);
+    aad.push(0);
+    aad.extend_from_slice(key_id);
+    aad
+}
+
+fn ack_record_aad(direction: u8, counter: u64) -> Vec<u8> {
+    let mut aad = b"network2-ack-record-v1".to_vec();
+    aad.push(direction);
+    aad.extend_from_slice(&counter.to_be_bytes());
+    aad
+}
+
+fn ack_retry_timeout(retry: usize) -> Duration {
+    ACK_RETRY_BASE * (1u32 << retry.min(3))
+}
+
+#[derive(Clone)]
+enum AckTx {
+    Server {
+        transport: transport::TransportServer,
+        peer_cid: Vec<u8>,
+    },
+    Client {
+        transport: transport::TransportClient,
+    },
+}
+
+impl AckTx {
+    fn send(&self, payload: Vec<u8>) -> PResult<()> {
+        match self {
+            Self::Server { transport, peer_cid } => {
+                transport.send(peer_cid, payload, Some(ACK_EID.to_vec()))?;
+            }
+            Self::Client { transport } => {
+                transport.send(payload, Some(ACK_EID.to_vec()))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct PendingAck {
+    state: Mutex<Option<bool>>,
+    changed: std::sync::Condvar,
+}
+
+impl PendingAck {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(None),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn reset(&self) {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn set(&self, acknowledged: bool) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if *state != Some(true) {
+            *state = Some(acknowledged);
+        }
+        self.changed.notify_all();
+    }
+
+    fn signal(&self) {
+        self.changed.notify_all();
+    }
+
+    fn wait(&self, timeout: Duration, closed: &AtomicBool) -> Option<bool> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if state.is_some() {
+                return *state;
+            }
+            if closed.load(Ordering::Acquire) {
+                return None;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let (next, result) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            state = next;
+            if result.timed_out() && state.is_none() {
+                return None;
+            }
+        }
+    }
+}
+
+struct AckChannel {
+    key: Vec<u8>,
+    tx: AckTx,
+    peer_cid: Vec<u8>,
+    peer_connection_id: u64,
+    send_direction: u8,
+    receive_direction: u8,
+    expected_data_direction: u8,
+    send_counter: Mutex<u64>,
+    receive_counter: Mutex<u64>,
+    pending: Mutex<HashMap<u64, Arc<PendingAck>>>,
+    closed: AtomicBool,
+}
+
+impl AckChannel {
+    fn server(
+        key: Vec<u8>,
+        transport: transport::TransportServer,
+        peer_cid: Vec<u8>,
+        peer_connection_id: u64,
+    ) -> Self {
+        Self {
+            key,
+            tx: AckTx::Server {
+                transport,
+                peer_cid: peer_cid.clone(),
+            },
+            peer_cid,
+            peer_connection_id,
+            send_direction: b'1',
+            receive_direction: b'0',
+            expected_data_direction: b'1',
+            send_counter: Mutex::new(0),
+            receive_counter: Mutex::new(0),
+            pending: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn client(key: Vec<u8>, transport: transport::TransportClient) -> Self {
+        Self {
+            key,
+            tx: AckTx::Client { transport },
+            peer_cid: Vec::new(),
+            peer_connection_id: 0,
+            send_direction: b'0',
+            receive_direction: b'1',
+            expected_data_direction: b'0',
+            send_counter: Mutex::new(0),
+            receive_counter: Mutex::new(1),
+            pending: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn send_ready(&self) -> PResult<()> {
+        let control_counter = {
+            let mut counter = self.send_counter.lock().unwrap_or_else(|e| e.into_inner());
+            *counter = counter
+                .checked_add(1)
+                .ok_or_else(|| ProtocolFailure("ACK control counter exhausted".into()))?;
+            *counter
+        };
+        let aad = ack_record_aad(self.send_direction, control_counter);
+        let encrypted = crypto::encrypt_gcm(ACK_READY_TAG, &self.key, Some(&aad))?;
+        let mut wire = Vec::with_capacity(8 + encrypted.len());
+        wire.extend_from_slice(&control_counter.to_be_bytes());
+        wire.extend_from_slice(&encrypted);
+        self.tx.send(wire)
+    }
+
+    fn register_pending(&self, counter: u64) -> PResult<Arc<PendingAck>> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ProtocolFailure("ACK channel is closed".into()));
+        }
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.contains_key(&counter) {
+            return Err(ProtocolFailure("duplicate pending data counter".into()));
+        }
+        let waiter = Arc::new(PendingAck::new());
+        pending.insert(counter, waiter.clone());
+        Ok(waiter)
+    }
+
+    fn remove_pending(&self, counter: u64) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&counter);
+    }
+
+    fn send_status(&self, acknowledged: bool, data_direction: u8, data_counter: u64) -> PResult<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ProtocolFailure("ACK channel is closed".into()));
+        }
+
+        // TCP already retries lost segments. These independently authenticated
+        // copies also cover a control frame discarded by the framing parser.
+        // Each copy gets a fresh control counter/nonce; duplicate statuses are
+        // idempotent at the sender because they name the same data counter.
+        let copies = if acknowledged { ACK_COPIES } else { 1 };
+        let mut queued = 0usize;
+        let mut last_error = None;
+
+        for _ in 0..copies {
+            let control_counter = {
+                let mut counter = self.send_counter.lock().unwrap_or_else(|e| e.into_inner());
+                *counter = counter
+                    .checked_add(1)
+                    .ok_or_else(|| ProtocolFailure("ACK control counter exhausted".into()))?;
+                *counter
+            };
+            let mut plaintext = Vec::with_capacity(10);
+            plaintext.push(if acknowledged { 1 } else { 2 });
+            plaintext.push(data_direction);
+            plaintext.extend_from_slice(&data_counter.to_be_bytes());
+            let aad = ack_record_aad(self.send_direction, control_counter);
+            let encrypted = crypto::encrypt_gcm(&plaintext, &self.key, Some(&aad))?;
+            let mut wire = Vec::with_capacity(8 + encrypted.len());
+            wire.extend_from_slice(&control_counter.to_be_bytes());
+            wire.extend_from_slice(&encrypted);
+
+            match self.tx.send(wire) {
+                Ok(()) => queued += 1,
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        if queued > 0 {
+            Ok(())
+        } else {
+            Err(last_error.unwrap_or_else(|| {
+                ProtocolFailure("could not enqueue ACK control record".into())
+            }))
+        }
+    }
+
+    fn receive_status(&self, wire: &[u8]) -> PResult<()> {
+        if wire.len() < 8 + crypto::AES_GCM_OVERHEAD + 10 {
+            return Err(ProtocolFailure("ACK control record is too short".into()));
+        }
+        let control_counter = u64::from_be_bytes(
+            wire[..8].try_into().expect("eight-byte ACK counter"),
+        );
+        let aad = ack_record_aad(self.receive_direction, control_counter);
+        let plaintext = crypto::decrypt_gcm(&wire[8..], &self.key, Some(&aad))?;
+        if plaintext.len() != 10 || (plaintext[0] != 1 && plaintext[0] != 2) {
+            return Err(ProtocolFailure("invalid ACK control payload".into()));
+        }
+        if plaintext[1] != self.expected_data_direction {
+            return Err(ProtocolFailure("ACK control direction mismatch".into()));
+        }
+
+        let mut last = self.receive_counter.lock().unwrap_or_else(|e| e.into_inner());
+        // Replayed control records are ignored after authenticating them.
+        if control_counter <= *last {
+            return Ok(());
+        }
+        *last = control_counter;
+        drop(last);
+
+        let data_counter = u64::from_be_bytes(
+            plaintext[2..10].try_into().expect("eight-byte data counter"),
+        );
+        let waiter = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&data_counter)
+            .cloned();
+        if let Some(waiter) = waiter {
+            waiter.set(plaintext[0] == 1);
+        }
+        Ok(())
+    }
+
+    fn close(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            for waiter in pending.values() {
+                waiter.signal();
+            }
+        }
+    }
+}
+
+fn send_data_with_ack<F>(
+    channel: &Arc<AckChannel>,
+    data_counter: u64,
+    mut send_frame: F,
+) -> PResult<()>
+where
+    F: FnMut() -> PResult<()>,
+{
+    let waiter = channel.register_pending(data_counter)?;
+    let result = (|| {
+        for retry in 0..=MAX_DATA_RETRIES {
+            if channel.closed.load(Ordering::Acquire) {
+                return Err(ProtocolFailure("ACK channel closed during send".into()));
+            }
+            waiter.reset();
+            if let Err(error) = send_frame() {
+                if retry == MAX_DATA_RETRIES {
+                    return Err(error);
+                }
+                thread::sleep(ack_retry_timeout(retry));
+                continue;
+            }
+            if waiter.wait(ack_retry_timeout(retry), &channel.closed) == Some(true) {
+                return Ok(());
+            }
+        }
+        Err(ProtocolFailure(format!(
+            "data counter {data_counter} was not acknowledged after {} retries",
+            MAX_DATA_RETRIES
+        )))
+    })();
+    channel.remove_pending(data_counter);
+    result
+}
+
+enum ReceivedData {
+    Fresh {
+        counter: u64,
+        plaintext: Vec<u8>,
+        fingerprint: [u8; 32],
+    },
+    Duplicate { counter: u64 },
+    Rejected { counter: u64 },
+}
+
+fn decode_data_record(
+    session: &mut Session,
+    wire: &[u8],
+    exchange: &[u8; 8],
+    direction: u8,
+) -> PResult<ReceivedData> {
+    if wire.len() < 8 {
+        return Err(ProtocolFailure("encrypted message is too short".into()));
+    }
+    let counter = u64::from_be_bytes(wire[..8].try_into().expect("eight-byte data counter"));
+    if wire.len() < 8 + crypto::AES_GCM_OVERHEAD {
+        return Ok(ReceivedData::Rejected { counter });
+    }
+    let mut aad = Vec::with_capacity(17);
+    aad.extend_from_slice(exchange);
+    aad.extend_from_slice(&wire[..8]);
+    aad.push(direction);
+    let plaintext = match crypto::decrypt_gcm(&wire[8..], &session.key, Some(&aad)) {
+        Ok(value) => value,
+        Err(_) => return Ok(ReceivedData::Rejected { counter }),
+    };
+    let fingerprint = *blake3::hash(wire).as_bytes();
+    if counter == session.receive_counter && session.last_received_hash == Some(fingerprint) {
+        return Ok(ReceivedData::Duplicate { counter });
+    }
+    if counter <= session.receive_counter {
+        return Ok(ReceivedData::Rejected { counter });
+    }
+    Ok(ReceivedData::Fresh {
+        counter,
+        plaintext,
+        fingerprint,
+    })
+}
+
+fn spawn_server_ack_reader(
+    transport: transport::TransportServer,
+    peer_cid: Vec<u8>,
+    channel: Arc<AckChannel>,
+) -> PResult<()> {
+    thread::Builder::new()
+        .name("network2-ack-rx-server".into())
+        .spawn(move || {
+            loop {
+                if channel.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                match transport.recv(&peer_cid, &ACK_EID, None) {
+                    Ok(Some(wire)) => {
+                        if let Err(error) = channel.receive_status(&wire) {
+                            eprintln!("network2: rejected ACK control record: {error}");
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        eprintln!("network2: ACK control receive failed: {error}");
+                        break;
+                    }
+                }
+            }
+            channel.close();
+        })
+        .map(|_| ())
+        .map_err(|error| ProtocolFailure(format!("could not start ACK reader: {error}")))
+}
+
+fn spawn_client_ack_reader(
+    transport: transport::TransportClient,
+    channel: Arc<AckChannel>,
+) -> PResult<()> {
+    thread::Builder::new()
+        .name("network2-ack-rx-client".into())
+        .spawn(move || {
+            loop {
+                if channel.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                match transport.recv(&ACK_EID, None) {
+                    Ok(Some(wire)) => {
+                        if let Err(error) = channel.receive_status(&wire) {
+                            eprintln!("network2: rejected ACK control record: {error}");
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        eprintln!("network2: ACK control receive failed: {error}");
+                        break;
+                    }
+                }
+            }
+            channel.close();
+        })
+        .map(|_| ())
+        .map_err(|error| ProtocolFailure(format!("could not start ACK reader: {error}")))
+}
+
+fn resolve_ack_port(port: u16, requested: Option<u16>) -> PResult<u16> {
+    let selected = match requested {
+        Some(value) => value,
+        None => port
+            .checked_add(1)
+            .ok_or_else(|| ProtocolFailure("main port 65535 requires an explicit ack_port".into()))?,
+    };
+    if selected == port {
+        return Err(ProtocolFailure("ack_port must differ from the main port".into()));
+    }
+    Ok(selected)
+}
+
 struct Session {
     key: Vec<u8>,
     send_counter: u64,
     receive_counter: u64,
+    last_received_hash: Option<[u8; 32]>,
+    send_gate: Arc<Mutex<()>>,
     admin: bool,
     username: Option<String>,
     connection_id: u64,
@@ -111,6 +582,8 @@ struct ClientIdentity {
 
 pub struct ProtocolServer {
     transport: Mutex<Option<transport::TransportServer>>,
+    ack_transport: Mutex<Option<transport::TransportServer>>,
+    ack_channels: Mutex<HashMap<Vec<u8>, Arc<AckChannel>>>,
     signing_private: Vec<u8>,
     signing_public: Vec<u8>,
     at_rest_key: Vec<u8>,
@@ -134,13 +607,17 @@ impl ProtocolServer {
         new_totp: bool,
         callback: Option<Py<PyAny>>,
         simult_exchanges: usize,
+        requested_ack_port: Option<u16>,
     ) -> PResult<Arc<Self>> {
         if !(1..=64).contains(&simult_exchanges) {
             return Err(ProtocolFailure("simult_exchanges must be between 1 and 64".into()));
         }
+        let ack_port = resolve_ack_port(port, requested_ack_port)?;
         let storage = initialize_server_storage(&password, new_totp)?;
         let server = Arc::new(Self {
             transport: Mutex::new(None),
+            ack_transport: Mutex::new(None),
+            ack_channels: Mutex::new(HashMap::new()),
             signing_private: storage.signing_private,
             signing_public: storage.signing_public,
             at_rest_key: storage.at_rest_key,
@@ -174,7 +651,7 @@ impl ProtocolServer {
             }
         });
         let transport = transport::TransportServer::new(
-            host,
+            host.clone(),
             port,
             1, // The legacy L3 wrapper fixes handshake concurrency at one.
             simult_exchanges,
@@ -182,8 +659,37 @@ impl ProtocolServer {
             exchange,
             disconnected,
         )?;
+
+        let weak = Arc::downgrade(&server);
+        let ack_handshake = Arc::new(move |temp: Vec<u8>| {
+            if let Some(server) = weak.upgrade() {
+                server.run_ack_handshake(&temp);
+            }
+        });
+        let ack_exchange = Arc::new(|_cid: Vec<u8>, _eid: [u8; 8]| {});
+        let weak = Arc::downgrade(&server);
+        let ack_disconnected = Arc::new(move |cid: Vec<u8>, connection_id: u64| {
+            if let Some(server) = weak.upgrade() {
+                server.forget_ack_generation(&cid, connection_id);
+            }
+        });
+        let ack_transport = transport::TransportServer::new(
+            host,
+            ack_port,
+            1,
+            simult_exchanges,
+            ack_handshake,
+            ack_exchange,
+            ack_disconnected,
+        )?;
+
+        *server.transport.lock().unwrap_or_else(|e| e.into_inner()) = Some(transport.clone());
+        *server.ack_transport.lock().unwrap_or_else(|e| e.into_inner()) = Some(ack_transport.clone());
         transport.start()?;
-        *server.transport.lock().unwrap_or_else(|e| e.into_inner()) = Some(transport);
+        if let Err(error) = ack_transport.start() {
+            transport.stop();
+            return Err(error.into());
+        }
         print_server_identity(&server.signing_public);
         Ok(server)
     }
@@ -209,6 +715,161 @@ impl ProtocolServer {
             .as_ref()
             .cloned()
             .ok_or_else(|| ProtocolFailure("server transport is not running".into()))
+    }
+
+    fn ack_transport(&self) -> PResult<transport::TransportServer> {
+        self.ack_transport
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| ProtocolFailure("ACK transport is not running".into()))
+    }
+
+    fn ack_channel(&self, cid: &[u8]) -> PResult<Arc<AckChannel>> {
+        self.ack_channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(cid)
+            .cloned()
+            .ok_or_else(|| ProtocolFailure("secondary ACK channel is not connected".into()))
+    }
+
+    fn find_session_by_ack_key_id(&self, key_id: &[u8]) -> PResult<(Vec<u8>, Vec<u8>)> {
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        for (cid, session) in sessions.iter() {
+            let session = session.lock().unwrap_or_else(|e| e.into_inner());
+            let control_key = ack_control_key(&session.key);
+            let candidate = ack_control_key_id(&control_key);
+            if ct_equal(&candidate, key_id) {
+                return Ok((cid.clone(), control_key));
+            }
+        }
+        Err(ProtocolFailure("secondary channel authentication failed".into()))
+    }
+
+    fn run_ack_handshake(self: &Arc<Self>, temp_cid: &[u8]) {
+        if let Err(error) = self.ack_handshake(temp_cid) {
+            eprintln!("network2 secondary-channel handshake failed: {error}");
+            if let Ok(transport) = self.ack_transport() {
+                transport.close_handshake(temp_cid);
+            }
+        }
+    }
+
+    fn ack_handshake(self: &Arc<Self>, temp_cid: &[u8]) -> PResult<()> {
+        let transport = self.ack_transport()?;
+        let hello = transport
+            .recv_handshake(temp_cid, Some(ACK_CONNECT_TIMEOUT))?
+            .ok_or_else(|| ProtocolFailure("secondary-channel hello timed out".into()))?;
+        if hello.len() < ACK_HELLO_MAGIC.len() + 16 + 8 + crypto::AES_GCM_OVERHEAD
+            || &hello[..ACK_HELLO_MAGIC.len()] != ACK_HELLO_MAGIC
+        {
+            return Err(ProtocolFailure("invalid secondary-channel hello".into()));
+        }
+
+        let key_id = &hello[ACK_HELLO_MAGIC.len()..ACK_HELLO_MAGIC.len() + 16];
+        let encrypted = &hello[ACK_HELLO_MAGIC.len() + 16..];
+        let (main_cid, control_key) = self.find_session_by_ack_key_id(key_id)?;
+        let hello_aad = ack_handshake_aad(b"client-hello", key_id);
+        let hello_plain = crypto::decrypt_gcm(encrypted, &control_key, Some(&hello_aad))?;
+        if hello_plain.len() != 40 || !ct_equal(&hello_plain[..8], ACK_HELLO_TAG) {
+            return Err(ProtocolFailure("secondary-channel hello proof failed".into()));
+        }
+        let client_nonce = &hello_plain[8..40];
+        let server_nonce = crypto::random_bytes(32)?;
+
+        let mut challenge_plain = Vec::with_capacity(72);
+        challenge_plain.extend_from_slice(ACK_CHALLENGE_TAG);
+        challenge_plain.extend_from_slice(client_nonce);
+        challenge_plain.extend_from_slice(&server_nonce);
+        let challenge_aad = ack_handshake_aad(b"server-challenge", key_id);
+        let challenge_encrypted =
+            crypto::encrypt_gcm(&challenge_plain, &control_key, Some(&challenge_aad))?;
+        let mut challenge = ACK_CHALLENGE_MAGIC.to_vec();
+        challenge.extend_from_slice(&challenge_encrypted);
+        transport.send_handshake(temp_cid, challenge)?;
+
+        let finish = transport
+            .recv_handshake(temp_cid, Some(ACK_CONNECT_TIMEOUT))?
+            .ok_or_else(|| ProtocolFailure("secondary-channel finish timed out".into()))?;
+        if finish.len() < ACK_FINISH_MAGIC.len() + 8 + crypto::AES_GCM_OVERHEAD
+            || &finish[..ACK_FINISH_MAGIC.len()] != ACK_FINISH_MAGIC
+        {
+            return Err(ProtocolFailure("invalid secondary-channel finish".into()));
+        }
+        let finish_aad = ack_handshake_aad(b"client-finish", key_id);
+        let finish_plain =
+            crypto::decrypt_gcm(&finish[ACK_FINISH_MAGIC.len()..], &control_key, Some(&finish_aad))?;
+        let mut expected_finish = Vec::with_capacity(72);
+        expected_finish.extend_from_slice(ACK_FINISH_TAG);
+        expected_finish.extend_from_slice(client_nonce);
+        expected_finish.extend_from_slice(&server_nonce);
+        if !ct_equal(&finish_plain, &expected_finish) {
+            return Err(ProtocolFailure("secondary-channel finish proof failed".into()));
+        }
+
+        let channel_key = ack_channel_key(&control_key, client_nonce, &server_nonce);
+        let peer_cid = crypto::basic_kdf(&main_cid, b"network2-ack-transport-cid-v1", 32);
+        let peer_connection_id = transport.connection_id(temp_cid)?;
+        self.close_ack_channel(&main_cid);
+        transport.auth_finished(temp_cid, peer_cid.clone(), None)?;
+
+        let channel = Arc::new(AckChannel::server(
+            channel_key,
+            transport.clone(),
+            peer_cid.clone(),
+            peer_connection_id,
+        ));
+        self.ack_channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(main_cid.clone(), channel.clone());
+        if let Err(error) =
+            spawn_server_ack_reader(transport.clone(), peer_cid.clone(), channel.clone())
+        {
+            self.close_ack_channel(&main_cid);
+            return Err(error);
+        }
+        if let Err(error) = channel.send_ready() {
+            self.close_ack_channel(&main_cid);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn close_ack_channel(&self, main_cid: &[u8]) {
+        let channel = self
+            .ack_channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(main_cid);
+        if let Some(channel) = channel {
+            channel.close();
+            if let Ok(transport) = self.ack_transport() {
+                let _ = transport.close_client(&channel.peer_cid);
+            }
+        }
+    }
+
+    fn forget_ack_generation(&self, peer_cid: &[u8], connection_id: u64) {
+        let main_cid = {
+            let channels = self.ack_channels.lock().unwrap_or_else(|e| e.into_inner());
+            channels.iter().find_map(|(main_cid, channel)| {
+                (channel.peer_cid == peer_cid && channel.peer_connection_id == connection_id)
+                    .then_some(main_cid.clone())
+            })
+        };
+        if let Some(main_cid) = main_cid {
+            if let Some(channel) = self
+                .ack_channels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&main_cid)
+            {
+                channel.close();
+            }
+        }
     }
 
     pub fn magic1(&self) -> PResult<Vec<u8>> {
@@ -370,6 +1031,8 @@ impl ProtocolServer {
                 admin: false,
                 username: Some(username.to_string()),
                 connection_id,
+                last_received_hash: None,
+                send_gate: Arc::new(Mutex::new(())),
             },
         )
     }
@@ -502,6 +1165,8 @@ impl ProtocolServer {
                 admin: false,
                 username: Some(fid),
                 connection_id,
+                last_received_hash: None,
+                send_gate: Arc::new(Mutex::new(())),
             },
         )
     }
@@ -589,6 +1254,8 @@ impl ProtocolServer {
                 admin: true,
                 username: None,
                 connection_id,
+                last_received_hash: None,
+                send_gate: Arc::new(Mutex::new(())),
             },
         )
     }
@@ -688,29 +1355,46 @@ impl ProtocolServer {
     }
 
     pub fn send(&self, payload: &[u8], eid: Option<&[u8]>, client_id: &[u8]) -> PResult<Vec<u8>> {
-        let session = self.session(client_id)?;
-        let mut session = session.lock().unwrap_or_else(|e| e.into_inner());
-        let exchange = match eid {
-            Some(value) => exact_eid(value)?,
-            None => crypto::random_bytes(8)?.try_into().expect("8 random bytes"),
+        let session_arc = self.session(client_id)?;
+        let send_gate = {
+            session_arc
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .send_gate
+                .clone()
         };
-        let counter = session.send_counter;
-        session.send_counter = session
-            .send_counter
-            .checked_add(1)
-            .ok_or_else(|| ProtocolFailure("send counter exhausted".into()))?;
-        let counter_bytes = counter.to_be_bytes();
-        let mut aad = Vec::with_capacity(17);
-        aad.extend_from_slice(&exchange);
-        aad.extend_from_slice(&counter_bytes);
-        aad.push(b'1'); // server-to-client
-        let encrypted = crypto::encrypt_gcm(payload, &session.key, Some(&aad))?;
-        let mut wire_payload = Vec::with_capacity(8 + encrypted.len());
-        wire_payload.extend_from_slice(&counter_bytes);
-        wire_payload.extend_from_slice(&encrypted);
-        // Keep the session lock through enqueue so the wire queue preserves
-        // the same order as the connection-wide counter.
-        self.transport()?.send(client_id, wire_payload, Some(exchange.to_vec()))?;
+        let _send_guard = send_gate.lock().unwrap_or_else(|e| e.into_inner());
+        let exchange: [u8; 8];
+        let counter: u64;
+        let wire_payload: Vec<u8>;
+        {
+            let mut session = session_arc.lock().unwrap_or_else(|e| e.into_inner());
+            exchange = match eid {
+                Some(value) => exact_eid(value)?,
+                None => crypto::random_bytes(8)?.try_into().expect("8 random bytes"),
+            };
+            counter = session.send_counter;
+            session.send_counter = session
+                .send_counter
+                .checked_add(1)
+                .ok_or_else(|| ProtocolFailure("send counter exhausted".into()))?;
+            let counter_bytes = counter.to_be_bytes();
+            let mut aad = Vec::with_capacity(17);
+            aad.extend_from_slice(&exchange);
+            aad.extend_from_slice(&counter_bytes);
+            aad.push(b'1'); // server-to-client
+            let encrypted = crypto::encrypt_gcm(payload, &session.key, Some(&aad))?;
+            let mut wire = Vec::with_capacity(8 + encrypted.len());
+            wire.extend_from_slice(&counter_bytes);
+            wire.extend_from_slice(&encrypted);
+            wire_payload = wire;
+        }
+        let ack = self.ack_channel(client_id)?;
+        let transport = self.transport()?;
+        send_data_with_ack(&ack, counter, || {
+            transport.send(client_id, wire_payload.clone(), Some(exchange.to_vec()))?;
+            Ok(())
+        })?;
         Ok(exchange.to_vec())
     }
 
@@ -735,24 +1419,38 @@ impl ProtocolServer {
             Ok(value) => value,
             Err(_) => return Ok(None),
         };
-        let wire = self.transport()?.recv(client_id, &exchange, timeout)?;
-        let Some(wire) = wire else { return Ok(None) };
-        if wire.len() < 8 + crypto::AES_GCM_OVERHEAD {
-            return Err(ProtocolFailure("encrypted message is too short".into()));
+        let ack = self.ack_channel(client_id)?;
+        let transport = self.transport()?;
+        let deadline = timeout.map(|value| Instant::now() + value);
+        loop {
+            let remaining = deadline.map(|value| value.saturating_duration_since(Instant::now()));
+            if remaining.is_some_and(|value| value.is_zero()) {
+                return Ok(None);
+            }
+            let wire = transport.recv(client_id, &exchange, remaining)?;
+            let Some(wire) = wire else { return Ok(None) };
+            let mut session = session_arc.lock().unwrap_or_else(|e| e.into_inner());
+            match decode_data_record(&mut session, &wire, &exchange, b'0')? {
+                ReceivedData::Fresh {
+                    counter,
+                    plaintext,
+                    fingerprint,
+                } => {
+                    // Commit delivery state only after the authenticated ACK
+                    // has entered the independent control channel's send queue.
+                    ack.send_status(true, b'0', counter)?;
+                    session.receive_counter = counter;
+                    session.last_received_hash = Some(fingerprint);
+                    return Ok(Some(plaintext));
+                }
+                ReceivedData::Duplicate { counter } => {
+                    ack.send_status(true, b'0', counter)?;
+                }
+                ReceivedData::Rejected { counter } => {
+                    ack.send_status(false, b'0', counter)?;
+                }
+            }
         }
-        let counter_bytes: [u8; 8] = wire[..8].try_into().expect("8-byte counter");
-        let counter = u64::from_be_bytes(counter_bytes);
-        let mut aad = Vec::with_capacity(17);
-        aad.extend_from_slice(&exchange);
-        aad.extend_from_slice(&counter_bytes);
-        aad.push(b'0'); // client-to-server
-        let mut session = session_arc.lock().unwrap_or_else(|e| e.into_inner());
-        let plaintext = crypto::decrypt_gcm(&wire[8..], &session.key, Some(&aad))?;
-        if counter <= session.receive_counter {
-            return Err(ProtocolFailure("Counter Error".into()));
-        }
-        session.receive_counter = counter;
-        Ok(Some(plaintext))
     }
 
     fn session(&self, cid: &[u8]) -> PResult<Arc<Mutex<Session>>> {
@@ -765,11 +1463,19 @@ impl ProtocolServer {
     }
 
     pub fn is_authed(&self, cid: &[u8]) -> bool {
-        self.sessions
+        let session_exists = self
+            .sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains_key(cid)
+            .contains_key(cid);
+        session_exists
             && self.transport().is_ok_and(|transport| transport.is_authed(cid))
+            && self
+                .ack_channels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(cid)
+                .is_some_and(|channel| !channel.closed.load(Ordering::Acquire))
     }
 
     pub fn set_backpressure(&self, cid: &[u8], enabled: bool) -> PResult<()> {
@@ -785,6 +1491,7 @@ impl ProtocolServer {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(cid);
+        self.close_ack_channel(cid);
         if close_socket {
             self.pending_bootstrap_totp
                 .lock()
@@ -812,6 +1519,10 @@ impl ProtocolServer {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(cid);
         }
+        drop(sessions);
+        if should_remove {
+            self.close_ack_channel(cid);
+        }
     }
 
     pub fn close(&self) {
@@ -820,6 +1531,21 @@ impl ProtocolServer {
         }
         if let Some(transport) = self
             .transport
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            transport.stop();
+        }
+        let channels = {
+            let mut channels = self.ack_channels.lock().unwrap_or_else(|e| e.into_inner());
+            channels.drain().map(|(_, channel)| channel).collect::<Vec<_>>()
+        };
+        for channel in channels {
+            channel.close();
+        }
+        if let Some(transport) = self
+            .ack_transport
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
@@ -1083,6 +1809,7 @@ impl ProtocolServer {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&target_cid);
+        self.close_ack_channel(&target_cid);
         self.send_json_reply(
             cid,
             eid,
@@ -1161,6 +1888,8 @@ impl Drop for ProtocolServer {
 
 pub struct ProtocolClient {
     transport: Mutex<Option<transport::TransportClient>>,
+    ack_transport: Mutex<Option<transport::TransportClient>>,
+    ack_channel: Mutex<Option<Arc<AckChannel>>>,
     session: Mutex<Option<Session>>,
     callback: Option<Py<PyAny>>,
     python_self: Mutex<Option<Py<PyAny>>>,
@@ -1175,10 +1904,12 @@ impl ProtocolClient {
         admin_auth_code: Option<String>,
         callback: Option<Py<PyAny>>,
         simult_exchanges: usize,
+        requested_ack_port: Option<u16>,
     ) -> PResult<Arc<Self>> {
         if !(1..=64).contains(&simult_exchanges) {
             return Err(ProtocolFailure("simult_exchanges must be between 1 and 64".into()));
         }
+        let ack_port = resolve_ack_port(port, requested_ack_port)?;
         let is_admin = admin_auth_code.is_some();
         let identity = if is_admin {
             None
@@ -1187,6 +1918,8 @@ impl ProtocolClient {
         };
         let client = Arc::new(Self {
             transport: Mutex::new(None),
+            ack_transport: Mutex::new(None),
+            ack_channel: Mutex::new(None),
             session: Mutex::new(None),
             callback,
             python_self: Mutex::new(None),
@@ -1209,7 +1942,130 @@ impl ProtocolClient {
             transport.close();
             return Err(error);
         }
+        if let Err(error) = client.connect_ack_channel(&host, ack_port, simult_exchanges) {
+            transport.close();
+            return Err(error);
+        }
         Ok(client)
+    }
+
+    fn connect_ack_channel(
+        &self,
+        host: &str,
+        ack_port: u16,
+        simult_exchanges: usize,
+    ) -> PResult<()> {
+        let noop: Arc<dyn Fn([u8; 8]) + Send + Sync> = Arc::new(|_| {});
+        let ack_transport =
+            transport::TransportClient::connect(host, ack_port, simult_exchanges, noop)?;
+
+        let (control_key, key_id) = {
+            let session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            let session = session
+                .as_ref()
+                .ok_or_else(|| ProtocolFailure("client is not authenticated".into()))?;
+            let key = ack_control_key(&session.key);
+            let id = ack_control_key_id(&key);
+            (key, id)
+        };
+
+        let setup = (|| -> PResult<Arc<AckChannel>> {
+            let client_nonce = crypto::random_bytes(32)?;
+            let mut hello_plain = Vec::with_capacity(40);
+            hello_plain.extend_from_slice(ACK_HELLO_TAG);
+            hello_plain.extend_from_slice(&client_nonce);
+            let hello_aad = ack_handshake_aad(b"client-hello", &key_id);
+            let hello_encrypted =
+                crypto::encrypt_gcm(&hello_plain, &control_key, Some(&hello_aad))?;
+            let mut hello = ACK_HELLO_MAGIC.to_vec();
+            hello.extend_from_slice(&key_id);
+            hello.extend_from_slice(&hello_encrypted);
+            ack_transport.send_handshake(hello)?;
+
+            let challenge = recv_client_handshake_required(
+                &ack_transport,
+                ACK_CONNECT_TIMEOUT,
+                "secondary-channel challenge",
+            )?;
+            if challenge.len() < ACK_CHALLENGE_MAGIC.len() + 8 + crypto::AES_GCM_OVERHEAD
+                || &challenge[..ACK_CHALLENGE_MAGIC.len()] != ACK_CHALLENGE_MAGIC
+            {
+                return Err(ProtocolFailure("invalid secondary-channel challenge".into()));
+            }
+            let challenge_aad = ack_handshake_aad(b"server-challenge", &key_id);
+            let challenge_plain = crypto::decrypt_gcm(
+                &challenge[ACK_CHALLENGE_MAGIC.len()..],
+                &control_key,
+                Some(&challenge_aad),
+            )?;
+            if challenge_plain.len() != 72
+                || !ct_equal(&challenge_plain[..8], ACK_CHALLENGE_TAG)
+                || !ct_equal(&challenge_plain[8..40], &client_nonce)
+            {
+                return Err(ProtocolFailure("secondary-channel challenge proof failed".into()));
+            }
+            let server_nonce = challenge_plain[40..72].to_vec();
+            let channel_key = ack_channel_key(&control_key, &client_nonce, &server_nonce);
+
+            let mut finish_plain = Vec::with_capacity(72);
+            finish_plain.extend_from_slice(ACK_FINISH_TAG);
+            finish_plain.extend_from_slice(&client_nonce);
+            finish_plain.extend_from_slice(&server_nonce);
+            let finish_aad = ack_handshake_aad(b"client-finish", &key_id);
+            let finish_encrypted =
+                crypto::encrypt_gcm(&finish_plain, &control_key, Some(&finish_aad))?;
+            let mut finish = ACK_FINISH_MAGIC.to_vec();
+            finish.extend_from_slice(&finish_encrypted);
+            ack_transport.send_handshake(finish)?;
+            ack_transport.auth_finished()?;
+
+            // Wait until the server has authenticated and installed its side
+            // of the secondary channel before the main TCP session is exposed.
+            let ready = ack_transport
+                .recv(&ACK_EID, Some(ACK_CONNECT_TIMEOUT))?
+                .ok_or_else(|| ProtocolFailure("secondary-channel ready message timed out".into()))?;
+            if ready.len() < 8 + crypto::AES_GCM_OVERHEAD {
+                return Err(ProtocolFailure("secondary-channel ready message is too short".into()));
+            }
+            let ready_counter = u64::from_be_bytes(
+                ready[..8].try_into().expect("eight-byte ready counter"),
+            );
+            let ready_aad = ack_record_aad(b'1', ready_counter);
+            let ready_plain = crypto::decrypt_gcm(&ready[8..], &channel_key, Some(&ready_aad))?;
+            if ready_counter != 1 || !ct_equal(&ready_plain, ACK_READY_TAG) {
+                return Err(ProtocolFailure("secondary-channel ready proof failed".into()));
+            }
+
+            Ok(Arc::new(AckChannel::client(
+                channel_key,
+                ack_transport.clone(),
+            )))
+        })();
+
+        let channel = match setup {
+            Ok(channel) => channel,
+            Err(error) => {
+                ack_transport.close();
+                return Err(error);
+            }
+        };
+        if let Err(error) = spawn_client_ack_reader(ack_transport.clone(), channel.clone()) {
+            channel.close();
+            ack_transport.close();
+            return Err(error);
+        }
+        *self.ack_transport.lock().unwrap_or_else(|e| e.into_inner()) = Some(ack_transport);
+        *self.ack_channel.lock().unwrap_or_else(|e| e.into_inner()) = Some(channel);
+        Ok(())
+    }
+
+    fn ack_channel(&self) -> PResult<Arc<AckChannel>> {
+        self.ack_channel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| ProtocolFailure("secondary ACK channel is not connected".into()))
     }
 
     pub fn set_python_self(&self, object: Py<PyAny>) {
@@ -1503,6 +2359,8 @@ impl ProtocolClient {
             admin: true,
             username: None,
             connection_id: 1,
+            last_received_hash: None,
+            send_gate: Arc::new(Mutex::new(())),
         });
         transport.auth_finished()?;
         Ok(())
@@ -1536,36 +2394,57 @@ impl ProtocolClient {
             admin: false,
             username: None,
             connection_id: 1,
+            last_received_hash: None,
+            send_gate: Arc::new(Mutex::new(())),
         });
         transport.auth_finished()?;
         Ok(())
     }
 
     pub fn send(&self, payload: &[u8], eid: Option<&[u8]>) -> PResult<Vec<u8>> {
-        let mut session_guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
-        let session = session_guard
-            .as_mut()
-            .ok_or_else(|| ProtocolFailure("client is not authenticated".into()))?;
-        let exchange: [u8; 8] = match eid {
-            Some(value) => exact_eid(value)?,
-            None => crypto::random_bytes(8)?.try_into().expect("8 random bytes"),
+        let send_gate = {
+            let session_guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            session_guard
+                .as_ref()
+                .ok_or_else(|| ProtocolFailure("client is not authenticated".into()))?
+                .send_gate
+                .clone()
         };
-        let counter = session.send_counter;
-        session.send_counter = session
-            .send_counter
-            .checked_add(1)
-            .ok_or_else(|| ProtocolFailure("send counter exhausted".into()))?;
-        let counter_bytes = counter.to_be_bytes();
-        let mut aad = Vec::with_capacity(17);
-        aad.extend_from_slice(&exchange);
-        aad.extend_from_slice(&counter_bytes);
-        aad.push(b'0'); // client-to-server
-        let encrypted = crypto::encrypt_gcm(payload, &session.key, Some(&aad))?;
-        let mut wire_payload = Vec::with_capacity(8 + encrypted.len());
-        wire_payload.extend_from_slice(&counter_bytes);
-        wire_payload.extend_from_slice(&encrypted);
-        self.transport()?
-            .send(wire_payload, Some(exchange.to_vec()))?;
+        let _send_guard = send_gate.lock().unwrap_or_else(|e| e.into_inner());
+        let exchange: [u8; 8];
+        let counter: u64;
+        let wire_payload: Vec<u8>;
+        {
+            let mut session_guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            let session = session_guard
+                .as_mut()
+                .ok_or_else(|| ProtocolFailure("client is not authenticated".into()))?;
+            exchange = match eid {
+                Some(value) => exact_eid(value)?,
+                None => crypto::random_bytes(8)?.try_into().expect("8 random bytes"),
+            };
+            counter = session.send_counter;
+            session.send_counter = session
+                .send_counter
+                .checked_add(1)
+                .ok_or_else(|| ProtocolFailure("send counter exhausted".into()))?;
+            let counter_bytes = counter.to_be_bytes();
+            let mut aad = Vec::with_capacity(17);
+            aad.extend_from_slice(&exchange);
+            aad.extend_from_slice(&counter_bytes);
+            aad.push(b'0'); // client-to-server
+            let encrypted = crypto::encrypt_gcm(payload, &session.key, Some(&aad))?;
+            let mut wire = Vec::with_capacity(8 + encrypted.len());
+            wire.extend_from_slice(&counter_bytes);
+            wire.extend_from_slice(&encrypted);
+            wire_payload = wire;
+        }
+        let ack = self.ack_channel()?;
+        let transport = self.transport()?;
+        send_data_with_ack(&ack, counter, || {
+            transport.send(wire_payload.clone(), Some(exchange.to_vec()))?;
+            Ok(())
+        })?;
         Ok(exchange.to_vec())
     }
 
@@ -1577,29 +2456,39 @@ impl ProtocolClient {
 
     fn recv_internal(&self, eid: &[u8], timeout: Option<Duration>) -> PResult<Option<Vec<u8>>> {
         let exchange = exact_eid(eid)?;
-        let wire = self.transport()?.recv(&exchange, timeout)?;
-        let Some(wire) = wire else { return Ok(None) };
-        if wire.len() < 8 + crypto::AES_GCM_OVERHEAD {
-            return Err(ProtocolFailure("encrypted message is too short".into()));
+        let ack = self.ack_channel()?;
+        let transport = self.transport()?;
+        let deadline = timeout.map(|value| Instant::now() + value);
+        loop {
+            let remaining = deadline.map(|value| value.saturating_duration_since(Instant::now()));
+            if remaining.is_some_and(|value| value.is_zero()) {
+                return Ok(None);
+            }
+            let wire = transport.recv(&exchange, remaining)?;
+            let Some(wire) = wire else { return Ok(None) };
+            let mut session_guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            let session = session_guard
+                .as_mut()
+                .ok_or_else(|| ProtocolFailure("client is not authenticated".into()))?;
+            match decode_data_record(session, &wire, &exchange, b'1')? {
+                ReceivedData::Fresh {
+                    counter,
+                    plaintext,
+                    fingerprint,
+                } => {
+                    ack.send_status(true, b'1', counter)?;
+                    session.receive_counter = counter;
+                    session.last_received_hash = Some(fingerprint);
+                    return Ok(Some(plaintext));
+                }
+                ReceivedData::Duplicate { counter } => {
+                    ack.send_status(true, b'1', counter)?;
+                }
+                ReceivedData::Rejected { counter } => {
+                    ack.send_status(false, b'1', counter)?;
+                }
+            }
         }
-        let counter_bytes: [u8; 8] = wire[..8].try_into().expect("8-byte counter");
-        let counter = u64::from_be_bytes(counter_bytes);
-        let mut aad = Vec::with_capacity(17);
-        aad.extend_from_slice(&exchange);
-        aad.extend_from_slice(&counter_bytes);
-        aad.push(b'1'); // server-to-client
-        let mut session_guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
-        let session = session_guard
-            .as_mut()
-            .ok_or_else(|| ProtocolFailure("client is not authenticated".into()))?;
-        // Decrypt first; a forged high counter must not advance the receive
-        // window when the GCM tag is invalid.
-        let plaintext = crypto::decrypt_gcm(&wire[8..], &session.key, Some(&aad))?;
-        if counter <= session.receive_counter {
-            return Err(ProtocolFailure("Counter Error".into()));
-        }
-        session.receive_counter = counter;
-        Ok(Some(plaintext))
     }
 
     fn transport(&self) -> PResult<transport::TransportClient> {
@@ -1620,6 +2509,22 @@ impl ProtocolClient {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
+        if let Some(channel) = self
+            .ack_channel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            channel.close();
+        }
+        if let Some(transport) = self
+            .ack_transport
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            transport.close();
+        }
         if let Some(transport) = self
             .transport
             .lock()
@@ -1634,6 +2539,12 @@ impl ProtocolClient {
     pub fn is_authed(&self) -> bool {
         self.session.lock().unwrap_or_else(|e| e.into_inner()).is_some()
             && self.transport().is_ok_and(|transport| transport.is_authed())
+            && self
+                .ack_channel
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|channel| !channel.closed.load(Ordering::Acquire))
     }
 
     pub fn magic1(&self) -> PResult<Vec<u8>> {
